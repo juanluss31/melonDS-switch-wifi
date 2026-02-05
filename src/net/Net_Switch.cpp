@@ -593,7 +593,7 @@ void Net_Switch::ProcessTCPConnections()
                     close(conn.socket);
                     eraseConn = true;
                 }
-                // Check for connection errors first
+                // Check for connection errors
                 else if (pollIndex >= 0 && (pollfds[pollIndex].revents & (POLLERR | POLLHUP)))
                 {
                     printf("Net_Switch: TCP connection failed (POLLERR/POLLHUP detected)\n");
@@ -602,47 +602,51 @@ void Net_Switch::ProcessTCPConnections()
                     close(conn.socket);
                     eraseConn = true;
                 }
-                // Check if socket is ready for writing (connection established) via POLLOUT
-                // OR periodically via getsockopt() fallback (every 100ms) for platforms where POLLOUT is unreliable
+                // Try to establish connection: check POLLOUT or periodically check via getsockopt()
+                // Check every 50ms to catch connections quickly
                 else if (pollIndex >= 0 && ((pollfds[pollIndex].revents & POLLOUT) || 
-                         (CurrentTime - conn.connectStartTime > 100000 && CurrentTime - conn.lastActivity > 100000)))
+                         (CurrentTime - conn.connectStartTime > 50000)))
                 {
                     int err = 0;
                     socklen_t errLen = sizeof(err);
-                    if (getsockopt(conn.socket, SOL_SOCKET, SO_ERROR, &err, &errLen) == 0 && err == 0)
+                    if (getsockopt(conn.socket, SOL_SOCKET, SO_ERROR, &err, &errLen) == 0)
                     {
-                        conn.connecting = false;
-                        conn.connected = true;
-                        printf("Net_Switch: TCP backend connected for port %d\n", conn.clientPort);
-
-                        if (!conn.recvBuffer.empty())
+                        if (err == 0)
                         {
-                            ssize_t sent = send(conn.socket, conn.recvBuffer.data(), conn.recvBuffer.size(), MSG_DONTWAIT);
-                            if (sent > 0)
+                            // Connection succeeded
+                            conn.connecting = false;
+                            conn.connected = true;
+                            printf("Net_Switch: TCP backend connected for port %d\n", conn.clientPort);
+
+                            if (!conn.recvBuffer.empty())
                             {
-                                printf("Net_Switch: TCP sent %zd buffered bytes\n", sent);
-                                // Only remove the bytes that were actually sent
-                                conn.recvBuffer.erase(conn.recvBuffer.begin(), conn.recvBuffer.begin() + sent);
+                                ssize_t sent = send(conn.socket, conn.recvBuffer.data(), conn.recvBuffer.size(), MSG_DONTWAIT);
+                                if (sent > 0)
+                                {
+                                    printf("Net_Switch: TCP sent %zd buffered bytes\n", sent);
+                                    // Only remove the bytes that were actually sent
+                                    conn.recvBuffer.erase(conn.recvBuffer.begin(), conn.recvBuffer.begin() + sent);
+                                }
+                                else if (sent < 0 && errno != EWOULDBLOCK && errno != EAGAIN)
+                                {
+                                    printf("Net_Switch: TCP buffered send failed (errno=%d)\n", errno);
+                                    SendTCPPacket(conn.destIP, conn.destPort, conn.clientIP, conn.clientPort,
+                                                  conn.serverSeqNext, conn.clientSeq, 0x14, nullptr, 0); // RST+ACK
+                                    eraseConn = true;
+                                }
+                                // If EWOULDBLOCK/EAGAIN, keep trying next frame
                             }
-                            else if (sent < 0 && errno != EWOULDBLOCK && errno != EAGAIN)
-                            {
-                                printf("Net_Switch: TCP buffered send failed (errno=%d)\n", errno);
-                                SendTCPPacket(conn.destIP, conn.destPort, conn.clientIP, conn.clientPort,
-                                              conn.serverSeqNext, conn.clientSeq, 0x14, nullptr, 0); // RST+ACK
-                                eraseConn = true;
-                            }
-                            // If EWOULDBLOCK/EAGAIN, keep trying next frame
+                        }
+                        else
+                        {
+                            // Connection failed
+                            printf("Net_Switch: TCP backend connect error (errno=%d)\n", err);
+                            SendTCPPacket(conn.destIP, conn.destPort, conn.clientIP, conn.clientPort,
+                                          conn.serverSeqNext, conn.clientSeq, 0x14, nullptr, 0); // RST+ACK
+                            close(conn.socket);
+                            eraseConn = true;
                         }
                     }
-                    else if (err != 0)
-                    {
-                        printf("Net_Switch: TCP backend connect error (errno=%d)\n", err);
-                        SendTCPPacket(conn.destIP, conn.destPort, conn.clientIP, conn.clientPort,
-                                      conn.serverSeqNext, conn.clientSeq, 0x14, nullptr, 0); // RST+ACK
-                        close(conn.socket);
-                        eraseConn = true;
-                    }
-                    conn.lastActivity = CurrentTime;
                 }
             }
 
