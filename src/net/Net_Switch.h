@@ -64,6 +64,10 @@ private:
         u64 lastActivity;
         u64 connectStartTime; // When connect() was initiated
         bool connecting;
+        bool serverFinSent;
+        bool serverFinAcked;
+        bool clientFinSeen;
+        u64 closingStartTime;
         std::vector<u8> recvBuffer;
     };
 

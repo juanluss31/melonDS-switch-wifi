@@ -668,10 +668,22 @@ void Net_Switch::ProcessTCPConnections()
                 {
                     printf("Net_Switch: TCP backend closed connection (seq=%u, ack=%u)\n",
                            conn.serverSeqNext, conn.clientSeq);
+
+                    // Send FIN+ACK to the client but keep the connection entry around
+                    // until the client ACKs and sends its FIN, otherwise it will retransmit.
                     SendTCPPacket(conn.destIP, conn.destPort, conn.clientIP, conn.clientPort,
                                   conn.serverSeqNext, conn.clientSeq, 0x11, nullptr, 0);
                     conn.serverSeqNext += 1;
-                    eraseConn = true;
+                    conn.serverFinSent = true;
+                    conn.serverFinAcked = false;
+                    conn.closingStartTime = CurrentTime;
+
+                    // Close backend socket now; we only need to talk to the client.
+                    if (conn.socket >= 0)
+                    {
+                        close(conn.socket);
+                        conn.socket = -1;
+                    }
                 }
                 else if (errno != EWOULDBLOCK && errno != EAGAIN)
                 {
@@ -1063,6 +1075,10 @@ void Net_Switch::HandleTCPFrame(u8* ipHeader, int ipLen)
             conn.lastActivity = CurrentTime;
             conn.connectStartTime = CurrentTime;
             conn.connecting = connecting;
+            conn.serverFinSent = false;
+            conn.serverFinAcked = false;
+            conn.clientFinSeen = false;
+            conn.closingStartTime = 0;
             conn.recvBuffer.clear();
             TCPConnections[key] = conn;
         }
@@ -1111,6 +1127,14 @@ void Net_Switch::HandleTCPFrame(u8* ipHeader, int ipLen)
                 conn.clientSeq = seqNum + 1;
                 if (conn.socket >= 0)
                     shutdown(conn.socket, SHUT_WR);
+
+                conn.clientFinSeen = true;
+            }
+            else if (isACK)
+            {
+                // Track ACKs during close handshake.
+                if (conn.serverFinSent && ackNum >= conn.serverSeqNext)
+                    conn.serverFinAcked = true;
             }
 
             // Send ACK for this packet - acknowledge the sequence number + data length
@@ -1123,25 +1147,44 @@ void Net_Switch::HandleTCPFrame(u8* ipHeader, int ipLen)
             // Let ProcessTCPConnections clean it up after backend connect completes/fails
             if (isFIN)
             {
-                printf("Net_Switch: Sending FIN-ACK in response\n");
-                SendTCPPacket(dstIP, dstPort, srcIP, srcPort, responseSeq, responseAck, 0x11, nullptr, 0);
+                // If we already sent a FIN to the client (backend initiated close),
+                // don't send another FIN here. Just ACKing is enough.
+                if (!conn.serverFinSent)
+                {
+                    printf("Net_Switch: Sending FIN-ACK in response\n");
+                    SendTCPPacket(dstIP, dstPort, srcIP, srcPort, responseSeq, responseAck, 0x11, nullptr, 0);
+                    conn.serverFinSent = true;
+                    conn.serverSeqNext += 1;
+                    conn.closingStartTime = CurrentTime;
+                }
                 
                 printf("Net_Switch: FIN received - conn.connecting=%d, conn.socket=%d\n", 
                        conn.connecting, conn.socket);
                 
-                // Only erase if backend is already connected or has no socket
-                if (!conn.connecting || conn.socket < 0)
+                // If both sides have finished the FIN/ACK dance, erase.
+                if (conn.serverFinSent && conn.serverFinAcked && conn.clientFinSeen)
                 {
-                    printf("Net_Switch: Erasing connection (not connecting or no socket)\n");
+                    printf("Net_Switch: Erasing connection (close handshake complete)\n");
                     if (conn.socket >= 0)
                         close(conn.socket);
                     TCPConnections.erase(it);
                 }
                 else
                 {
-                    printf("Net_Switch: Keeping connection alive (still connecting)\n");
+                    printf("Net_Switch: Keeping connection alive (closing)\n");
                 }
                 // If still connecting, mark for later cleanup but keep trying to connect
+            }
+            else
+            {
+                // If backend has already closed and client ACKed our FIN, we still need to
+                // wait for the client's FIN before deleting, otherwise it will retransmit.
+                if (conn.serverFinSent && conn.serverFinAcked && conn.clientFinSeen)
+                {
+                    if (conn.socket >= 0)
+                        close(conn.socket);
+                    TCPConnections.erase(it);
+                }
             }
         }
     }
