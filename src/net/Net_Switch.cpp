@@ -528,12 +528,22 @@ void Net_Switch::ProcessTCPConnections()
                     {
                         conn.connecting = false;
                         conn.connected = true;
+                        printf("Net_Switch: TCP backend connected for port %d\n", conn.clientPort);
 
                         if (!conn.recvBuffer.empty())
                         {
-                            send(conn.socket, conn.recvBuffer.data(), conn.recvBuffer.size(), 0);
+                            ssize_t sent = send(conn.socket, conn.recvBuffer.data(), conn.recvBuffer.size(), 0);
+                            if (sent < 0 && errno != EWOULDBLOCK && errno != EAGAIN)
+                                printf("Net_Switch: TCP buffered send failed (errno=%d)\n", errno);
                             conn.recvBuffer.clear();
                         }
+                    }
+                    else
+                    {
+                        printf("Net_Switch: TCP backend connect error (errno=%d)\n", err);
+                        SendTCPPacket(conn.destIP, conn.destPort, conn.clientIP, conn.clientPort,
+                                      conn.serverSeqNext, conn.clientSeq, 0x14, nullptr, 0); // RST+ACK
+                        eraseConn = true;
                     }
                 }
             }
@@ -542,6 +552,7 @@ void Net_Switch::ProcessTCPConnections()
             ssize_t received = recv(conn.socket, buffer, sizeof(buffer), MSG_DONTWAIT);
             if (received > 0)
             {
+                printf("Net_Switch: TCP backend received %zd bytes\n", received);
                 SendTCPPacket(conn.destIP, conn.destPort, conn.clientIP, conn.clientPort,
                               conn.serverSeqNext, conn.clientSeq, 0x18, buffer, (int)received);
                 conn.serverSeqNext += (u32)received;
@@ -549,6 +560,7 @@ void Net_Switch::ProcessTCPConnections()
             }
             else if (received == 0)
             {
+                printf("Net_Switch: TCP backend closed connection\n");
                 SendTCPPacket(conn.destIP, conn.destPort, conn.clientIP, conn.clientPort,
                               conn.serverSeqNext, conn.clientSeq, 0x11, nullptr, 0);
                 conn.serverSeqNext += 1;
@@ -556,6 +568,7 @@ void Net_Switch::ProcessTCPConnections()
             }
             else if (errno != EWOULDBLOCK && errno != EAGAIN)
             {
+                printf("Net_Switch: TCP backend recv failed (errno=%d)\n", errno);
                 eraseConn = true;
             }
         }
@@ -913,6 +926,7 @@ void Net_Switch::HandleTCPFrame(u8* ipHeader, int ipLen)
                     connecting = true;
                 else
                 {
+                    printf("Net_Switch: TCP connect failed (errno=%d)\n", errno);
                     close(sock);
                     sock = -1;
                 }
@@ -934,6 +948,10 @@ void Net_Switch::HandleTCPFrame(u8* ipHeader, int ipLen)
             conn.recvBuffer.clear();
             TCPConnections[key] = conn;
         }
+        else
+        {
+            printf("Net_Switch: TCP socket creation failed (errno=%d)\n", errno);
+        }
     }
     // For all other packets on established connections, just send ACK
     else
@@ -950,7 +968,9 @@ void Net_Switch::HandleTCPFrame(u8* ipHeader, int ipLen)
                 {
                     if (conn.connected)
                     {
-                        send(conn.socket, payload, dataLen, 0);
+                        ssize_t sent = send(conn.socket, payload, dataLen, 0);
+                        if (sent < 0 && errno != EWOULDBLOCK && errno != EAGAIN)
+                            printf("Net_Switch: TCP send failed (errno=%d)\n", errno);
                     }
                     else
                     {
