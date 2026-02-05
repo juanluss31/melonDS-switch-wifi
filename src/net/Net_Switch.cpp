@@ -24,6 +24,20 @@
 #include <vector>
 #include "Net_Switch.h"
 
+// nxlink printf() is effectively a blocking IO sink on Switch.
+// Keep high-volume logs behind a compile-time flag to avoid framerate collapse.
+#ifndef NETSWITCH_LOG_TRACE
+#define NETSWITCH_LOG_TRACE 0
+#endif
+
+#ifndef NETSWITCH_LOG_INFO
+#define NETSWITCH_LOG_INFO 1
+#endif
+
+#define NS_TRACE(...) do { if (NETSWITCH_LOG_TRACE) printf(__VA_ARGS__); } while (0)
+#define NS_INFO(...)  do { if (NETSWITCH_LOG_INFO)  printf(__VA_ARGS__); } while (0)
+#define NS_ERR(...)   do { printf(__VA_ARGS__); } while (0)
+
 #ifdef __SWITCH__
 #include <switch.h>
 #include <sys/socket.h>
@@ -56,7 +70,7 @@ Net_Switch::Net_Switch(const SendPacketCallback& callback)
     // Initialize BSD sockets on Switch
     socketInitializeDefault();
     Initialized = true;
-    printf("Net_Switch: Network driver initialized\n");
+    NS_INFO("Net_Switch: Network driver initialized\n");
 #endif
 }
 
@@ -230,7 +244,7 @@ void Net_Switch::HandleARPFrame(u8* data, int len)
     u16 op = (data[20] << 8) | data[21];
     if (op != 1) return; // Only handle requests
 
-    printf("Net_Switch: ARP Request for %d.%d.%d.%d\n",
+    NS_TRACE("Net_Switch: ARP Request for %d.%d.%d.%d\n",
            data[38], data[39], data[40], data[41]);
 
     // Build ARP reply
@@ -254,7 +268,7 @@ void Net_Switch::HandleARPFrame(u8* data, int len)
     memcpy(&reply[32], &data[22], 6); // Target MAC (sender MAC from request)
     memcpy(&reply[38], &data[28], 4); // Target IP (sender IP from request)
 
-    printf("Net_Switch: Sending ARP Reply\n");
+    NS_TRACE("Net_Switch: Sending ARP Reply\n");
     if (Callback)
         Callback(reply, 42);
 }
@@ -266,7 +280,7 @@ void Net_Switch::HandleDNSFrame(u8* data, int len, u32 srcIP, u16 srcPort)
     
     if (len < 12)
     {
-        printf("Net_Switch: DNS query too short\n");
+        NS_TRACE("Net_Switch: DNS query too short\n");
         return;
     }
 
@@ -275,7 +289,7 @@ void Net_Switch::HandleDNSFrame(u8* data, int len, u32 srcIP, u16 srcPort)
     u16 numquestions = ntohs(*(u16*)&data[4]);
     u16 numanswers = ntohs(*(u16*)&data[6]);
 
-    printf("Net_Switch: DNS query - ID:%04X flags:%04X questions:%d answers:%d\n",
+    NS_TRACE("Net_Switch: DNS query - ID:%04X flags:%04X questions:%d answers:%d\n",
            id, flags, numquestions, numanswers);
 
     // Only handle simple queries (no response flag, single question, no existing answers)
@@ -296,7 +310,7 @@ void Net_Switch::HandleDNSFrame(u8* data, int len, u32 srcIP, u16 srcPort)
     // For now, we forward all DNS queries to maintain compatibility
     // A full implementation would parse the query and resolve locally
     u32 realDNS = 0x08080808; // 8.8.8.8
-    printf("Net_Switch: Forwarding DNS query to 8.8.8.8\n");
+    NS_TRACE("Net_Switch: Forwarding DNS query to 8.8.8.8\n");
     ForwardUDPPacket(srcIP, srcPort, realDNS, 53, data, len);
     // Mark the connection as DNS so responses are sent from 10.64.0.2
     u32 key = MakeConnectionKey(srcIP, srcPort);
@@ -413,7 +427,7 @@ void Net_Switch::SendTCPPacket(u32 srcIP, u16 srcPort, u32 dstIP, u16 dstPort,
     tcpHeader[17] = (tcpChecksum & 0xFF);
 
     if (len > 0 || (flags & 0x08)) // Log if sending data or FIN
-        printf("Net_Switch: Sending TCP packet to client: len=%d, flags=0x%02x, seq=%u, ack=%u\n",
+        NS_TRACE("Net_Switch: Sending TCP packet to client: len=%d, flags=0x%02x, seq=%u, ack=%u\n",
                len, flags, seq, ack);
 
     if (Callback)
@@ -497,7 +511,7 @@ void Net_Switch::ProcessUDPConnections()
             if (conn.isDNS)
             {
                 responseSrcIP = kDNSIP; // 10.64.0.2
-                printf("Net_Switch: DNS response received, forwarding to client\n");
+                NS_TRACE("Net_Switch: DNS response received, forwarding to client\n");
             }
             else
             {
@@ -518,14 +532,6 @@ void Net_Switch::ProcessTCPConnections()
 #ifdef __SWITCH__
     if (TCPConnections.empty())
         return;
-
-    // Count connecting sockets for debug purposes (but don't spam logs)
-    int connectingCount = 0;
-    for (auto& pair : TCPConnections)
-    {
-        if (pair.second.connecting)
-            connectingCount++;
-    }
 
     // Build pollfd array for all TCP sockets
     std::vector<struct pollfd> pollfds;
@@ -550,10 +556,8 @@ void Net_Switch::ProcessTCPConnections()
         return;
     
     // Poll all sockets at once (timeout 0 = non-blocking check)
-    // Use 10ms timeout to give connecting sockets time to progress
-    int ready = poll(pollfds.data(), pollfds.size(), 10);
-    
-    // Process results without spamming logs
+    // IMPORTANT: do not block here (even 10ms per frame will tank framerate)
+    (void)poll(pollfds.data(), pollfds.size(), 0);
     
     // Process all sockets (check connecting ones even without poll activity)
     for (auto it = TCPConnections.begin(); it != TCPConnections.end(); )
@@ -580,6 +584,16 @@ void Net_Switch::ProcessTCPConnections()
             continue;
         }
 
+        // If the backend socket is already closed (we keep the entry around for TCP close handshake)
+        // time out the closing state so we don't leak entries forever.
+        if (conn.socket < 0)
+        {
+            if (conn.serverFinSent && conn.closingStartTime != 0 && (CurrentTime - conn.closingStartTime > 2000000))
+            {
+                eraseConn = true;
+            }
+        }
+
         if (conn.socket >= 0)
         {
             if (conn.connecting)
@@ -587,7 +601,7 @@ void Net_Switch::ProcessTCPConnections()
                 // Check for connection timeout (5 seconds)
                 if (CurrentTime - conn.connectStartTime > 5000000)
                 {
-                    printf("Net_Switch: TCP connection timeout for port %d after 5 seconds\n", conn.clientPort);
+                    NS_ERR("Net_Switch: TCP connection timeout for port %d after 5 seconds\n", conn.clientPort);
                     SendTCPPacket(conn.destIP, conn.destPort, conn.clientIP, conn.clientPort,
                                   conn.serverSeqNext, conn.clientSeq, 0x14, nullptr, 0); // RST+ACK
                     close(conn.socket);
@@ -596,7 +610,7 @@ void Net_Switch::ProcessTCPConnections()
                 // Check for connection errors
                 else if (pollIndex >= 0 && (pollfds[pollIndex].revents & (POLLERR | POLLHUP)))
                 {
-                    printf("Net_Switch: TCP connection failed (POLLERR/POLLHUP detected)\n");
+                    NS_ERR("Net_Switch: TCP connection failed (POLLERR/POLLHUP detected)\n");
                     SendTCPPacket(conn.destIP, conn.destPort, conn.clientIP, conn.clientPort,
                                   conn.serverSeqNext, conn.clientSeq, 0x14, nullptr, 0); // RST+ACK
                     close(conn.socket);
@@ -616,20 +630,20 @@ void Net_Switch::ProcessTCPConnections()
                             // Connection succeeded
                             conn.connecting = false;
                             conn.connected = true;
-                            printf("Net_Switch: TCP backend connected for port %d\n", conn.clientPort);
+                            NS_INFO("Net_Switch: TCP backend connected for port %d\n", conn.clientPort);
 
                             if (!conn.recvBuffer.empty())
                             {
                                 ssize_t sent = send(conn.socket, conn.recvBuffer.data(), conn.recvBuffer.size(), MSG_DONTWAIT);
                                 if (sent > 0)
                                 {
-                                    printf("Net_Switch: TCP sent %zd buffered bytes\n", sent);
+                                    NS_TRACE("Net_Switch: TCP sent %zd buffered bytes\n", sent);
                                     // Only remove the bytes that were actually sent
                                     conn.recvBuffer.erase(conn.recvBuffer.begin(), conn.recvBuffer.begin() + sent);
                                 }
                                 else if (sent < 0 && errno != EWOULDBLOCK && errno != EAGAIN)
                                 {
-                                    printf("Net_Switch: TCP buffered send failed (errno=%d)\n", errno);
+                                    NS_ERR("Net_Switch: TCP buffered send failed (errno=%d)\n", errno);
                                     SendTCPPacket(conn.destIP, conn.destPort, conn.clientIP, conn.clientPort,
                                                   conn.serverSeqNext, conn.clientSeq, 0x14, nullptr, 0); // RST+ACK
                                     eraseConn = true;
@@ -640,7 +654,7 @@ void Net_Switch::ProcessTCPConnections()
                         else
                         {
                             // Connection failed
-                            printf("Net_Switch: TCP backend connect error (errno=%d)\n", err);
+                            NS_ERR("Net_Switch: TCP backend connect error (errno=%d)\n", err);
                             SendTCPPacket(conn.destIP, conn.destPort, conn.clientIP, conn.clientPort,
                                           conn.serverSeqNext, conn.clientSeq, 0x14, nullptr, 0); // RST+ACK
                             close(conn.socket);
@@ -657,7 +671,7 @@ void Net_Switch::ProcessTCPConnections()
                 ssize_t received = recv(conn.socket, buffer, sizeof(buffer), MSG_DONTWAIT);
                 if (received > 0)
                 {
-                    printf("Net_Switch: TCP backend received %zd bytes, forwarding to client (seq=%u, ack=%u)\n", 
+                          NS_TRACE("Net_Switch: TCP backend received %zd bytes, forwarding to client (seq=%u, ack=%u)\n", 
                            received, conn.serverSeqNext, conn.clientSeq);
                     SendTCPPacket(conn.destIP, conn.destPort, conn.clientIP, conn.clientPort,
                                   conn.serverSeqNext, conn.clientSeq, 0x18, buffer, (int)received);
@@ -666,7 +680,7 @@ void Net_Switch::ProcessTCPConnections()
                 }
                 else if (received == 0)
                 {
-                    printf("Net_Switch: TCP backend closed connection (seq=%u, ack=%u)\n",
+                          NS_TRACE("Net_Switch: TCP backend closed connection (seq=%u, ack=%u)\n",
                            conn.serverSeqNext, conn.clientSeq);
 
                     // Send FIN+ACK to the client but keep the connection entry around
@@ -687,7 +701,7 @@ void Net_Switch::ProcessTCPConnections()
                 }
                 else if (errno != EWOULDBLOCK && errno != EAGAIN)
                 {
-                    printf("Net_Switch: TCP backend recv failed (errno=%d)\n", errno);
+                    NS_ERR("Net_Switch: TCP backend recv failed (errno=%d)\n", errno);
                     eraseConn = true;
                 }
             }
@@ -716,7 +730,7 @@ void Net_Switch::CleanupOldConnections()
     {
         if (CurrentTime - it->second.lastActivity > UDP_TIMEOUT)
         {
-            printf("Net_Switch: Closing idle UDP connection on port %d\n", it->second.clientPort);
+            NS_TRACE("Net_Switch: Closing idle UDP connection on port %d\n", it->second.clientPort);
             close(it->second.socket);
             it = UDPConnections.erase(it);
         }
@@ -732,7 +746,7 @@ void Net_Switch::CleanupOldConnections()
     {
         if (CurrentTime - itTcp->second.lastActivity > TCP_TIMEOUT)
         {
-            printf("Net_Switch: Closing idle TCP connection on port %d\n", itTcp->second.clientPort);
+            NS_TRACE("Net_Switch: Closing idle TCP connection on port %d\n", itTcp->second.clientPort);
             if (itTcp->second.socket >= 0)
                 close(itTcp->second.socket);
             itTcp = TCPConnections.erase(itTcp);
@@ -930,22 +944,21 @@ void Net_Switch::HandleIPFrame(u8* data, int len)
     u8 protocol = data[9];
     u32 srcIP = ntohl(*(u32*)&data[12]);
     u32 dstIP = ntohl(*(u32*)&data[16]);
-    
-    printf("Net_Switch: IP packet - protocol %d, %d.%d.%d.%d -> %d.%d.%d.%d (len=%d)\n",
-           protocol,
-           srcIP >> 24, (srcIP >> 16) & 0xFF, (srcIP >> 8) & 0xFF, srcIP & 0xFF,
-           dstIP >> 24, (dstIP >> 16) & 0xFF, (dstIP >> 8) & 0xFF, dstIP & 0xFF,
-           len);
+
+    NS_TRACE("Net_Switch: IP packet - protocol %d, %d.%d.%d.%d -> %d.%d.%d.%d (len=%d)\n",
+             protocol,
+             srcIP >> 24, (srcIP >> 16) & 0xFF, (srcIP >> 8) & 0xFF, srcIP & 0xFF,
+             dstIP >> 24, (dstIP >> 16) & 0xFF, (dstIP >> 8) & 0xFF, dstIP & 0xFF,
+             len);
     
     // Handle UDP packets
     if (protocol == 0x11) // UDP
     {
-        printf("Net_Switch: UDP detected (protocol 0x11)\n");
+        NS_TRACE("Net_Switch: UDP detected (protocol 0x11)\n");
         HandleUDPFrame(data, len);
         return;
     }
-    
-    // Handle ICMP packets (ping)
+
     if (protocol == 0x01) // ICMP
     {
         HandleICMPFrame(data, len);
@@ -976,7 +989,7 @@ void Net_Switch::HandleICMPFrame(u8* ipHeader, int ipLen)
     if (type == 8 && code == 0)
     {
         int icmpLen = ipLen - ihl;
-        printf("Net_Switch: ICMP Echo Request\n");
+        NS_TRACE("Net_Switch: ICMP Echo Request\n");
 
         // Send Echo Reply back
         SendICMPPacket(dstIP, srcIP, 0, 0, icmp + 8, icmpLen - 8);
@@ -1010,7 +1023,7 @@ void Net_Switch::HandleTCPFrame(u8* ipHeader, int ipLen)
     int dataLen = (int)totalLen - ihl - tcpHeaderLen;
     u8* payload = tcp + tcpHeaderLen;
     
-    printf("Net_Switch: TCP %u.%u.%u.%u:%u -> %u.%u.%u.%u:%u (flags=0x%02x)\n",
+    NS_TRACE("Net_Switch: TCP %u.%u.%u.%u:%u -> %u.%u.%u.%u:%u (flags=0x%02x)\n",
            srcIP & 0xFF, (srcIP >> 8) & 0xFF, (srcIP >> 16) & 0xFF, (srcIP >> 24) & 0xFF, srcPort,
            dstIP & 0xFF, (dstIP >> 8) & 0xFF, (dstIP >> 16) & 0xFF, (dstIP >> 24) & 0xFF, dstPort,
            flags);
@@ -1020,7 +1033,7 @@ void Net_Switch::HandleTCPFrame(u8* ipHeader, int ipLen)
     // Only handle SYN packets (new connection initiation)
     if (isSYN && !isACK)
     {
-        printf("Net_Switch: Responding to TCP SYN with SYN-ACK\n");
+        NS_TRACE("Net_Switch: Responding to TCP SYN with SYN-ACK\n");
         u32 responseSeq = 0x10000000;
         u32 responseAck = seqNum + 1;
         SendTCPPacket(dstIP, dstPort, srcIP, srcPort, responseSeq, responseAck, 0x12, nullptr, 0);
@@ -1045,19 +1058,19 @@ void Net_Switch::HandleTCPFrame(u8* ipHeader, int ipLen)
                 if (errno == EINPROGRESS)
                 {
                     connecting = true;
-                    printf("Net_Switch: TCP connect to %u.%u.%u.%u:%u in progress (EINPROGRESS)\n",
+                    NS_TRACE("Net_Switch: TCP connect to %u.%u.%u.%u:%u in progress (EINPROGRESS)\n",
                            dstIP & 0xFF, (dstIP >> 8) & 0xFF, (dstIP >> 16) & 0xFF, (dstIP >> 24) & 0xFF, dstPort);
                 }
                 else
                 {
-                    printf("Net_Switch: TCP connect failed (errno=%d)\n", errno);
+                    NS_ERR("Net_Switch: TCP connect failed (errno=%d)\n", errno);
                     close(sock);
                     sock = -1;
                 }
             }
             else
             {
-                printf("Net_Switch: TCP connect to %u.%u.%u.%u:%u succeeded immediately\n",
+                NS_TRACE("Net_Switch: TCP connect to %u.%u.%u.%u:%u succeeded immediately\n",
                        dstIP & 0xFF, (dstIP >> 8) & 0xFF, (dstIP >> 16) & 0xFF, (dstIP >> 24) & 0xFF, dstPort);
             }
 
@@ -1084,7 +1097,7 @@ void Net_Switch::HandleTCPFrame(u8* ipHeader, int ipLen)
         }
         else
         {
-            printf("Net_Switch: TCP socket creation failed (errno=%d)\n", errno);
+            NS_ERR("Net_Switch: TCP socket creation failed (errno=%d)\n", errno);
         }
     }
     // For all other packets on established connections, just send ACK
@@ -1096,9 +1109,16 @@ void Net_Switch::HandleTCPFrame(u8* ipHeader, int ipLen)
             TCPConnection& conn = it->second;
             conn.lastActivity = CurrentTime;
 
+            // Track ACKs during close handshake even when combined with FIN.
+            if (isACK)
+            {
+                if (conn.serverFinSent && ackNum >= conn.serverSeqNext)
+                    conn.serverFinAcked = true;
+            }
+
             if (dataLen > 0)
             {
-                printf("Net_Switch: TCP client sent %d bytes (seq=%u)\n", dataLen, seqNum);
+                NS_TRACE("Net_Switch: TCP client sent %d bytes (seq=%u)\n", dataLen, seqNum);
                 if (conn.socket >= 0)
                 {
                     if (conn.connected)
@@ -1107,16 +1127,16 @@ void Net_Switch::HandleTCPFrame(u8* ipHeader, int ipLen)
                         if (sent < 0)
                         {
                             if (errno != EWOULDBLOCK && errno != EAGAIN)
-                                printf("Net_Switch: TCP forward send failed (errno=%d)\n", errno);
+                                NS_ERR("Net_Switch: TCP forward send failed (errno=%d)\n", errno);
                         }
                         else
                         {
-                            printf("Net_Switch: TCP forwarded %zd bytes to backend\n", sent);
+                            NS_TRACE("Net_Switch: TCP forwarded %zd bytes to backend\n", sent);
                         }
                     }
                     else
                     {
-                        printf("Net_Switch: TCP buffering %d bytes (not connected yet)\n", dataLen);
+                        NS_TRACE("Net_Switch: TCP buffering %d bytes (not connected yet)\n", dataLen);
                         conn.recvBuffer.insert(conn.recvBuffer.end(), payload, payload + dataLen);
                     }
                 }
@@ -1140,7 +1160,7 @@ void Net_Switch::HandleTCPFrame(u8* ipHeader, int ipLen)
             // Send ACK for this packet - acknowledge the sequence number + data length
             u32 responseSeq = conn.serverSeqNext;
             u32 responseAck = conn.clientSeq;
-            printf("Net_Switch: Sending TCP ACK\n");
+            NS_TRACE("Net_Switch: Sending TCP ACK\n");
             SendTCPPacket(dstIP, dstPort, srcIP, srcPort, responseSeq, responseAck, 0x10, nullptr, 0);
             
             // If FIN, send FIN-ACK but don't erase immediately if backend is connecting
@@ -1151,27 +1171,27 @@ void Net_Switch::HandleTCPFrame(u8* ipHeader, int ipLen)
                 // don't send another FIN here. Just ACKing is enough.
                 if (!conn.serverFinSent)
                 {
-                    printf("Net_Switch: Sending FIN-ACK in response\n");
+                    NS_TRACE("Net_Switch: Sending FIN-ACK in response\n");
                     SendTCPPacket(dstIP, dstPort, srcIP, srcPort, responseSeq, responseAck, 0x11, nullptr, 0);
                     conn.serverFinSent = true;
                     conn.serverSeqNext += 1;
                     conn.closingStartTime = CurrentTime;
                 }
                 
-                printf("Net_Switch: FIN received - conn.connecting=%d, conn.socket=%d\n", 
+                NS_TRACE("Net_Switch: FIN received - conn.connecting=%d, conn.socket=%d\n", 
                        conn.connecting, conn.socket);
                 
                 // If both sides have finished the FIN/ACK dance, erase.
                 if (conn.serverFinSent && conn.serverFinAcked && conn.clientFinSeen)
                 {
-                    printf("Net_Switch: Erasing connection (close handshake complete)\n");
+                    NS_TRACE("Net_Switch: Erasing connection (close handshake complete)\n");
                     if (conn.socket >= 0)
                         close(conn.socket);
                     TCPConnections.erase(it);
                 }
                 else
                 {
-                    printf("Net_Switch: Keeping connection alive (closing)\n");
+                    NS_TRACE("Net_Switch: Keeping connection alive (closing)\n");
                 }
                 // If still connecting, mark for later cleanup but keep trying to connect
             }
@@ -1206,7 +1226,7 @@ void Net_Switch::HandleUDPFrame(u8* ipHeader, int ipLen)
     int dataLen = udpLen - 8;
     if (dataLen < 0 || ihl + udpLen > ipLen) return;
 
-    printf("Net_Switch: UDP %d.%d.%d.%d:%d -> %d.%d.%d.%d:%d (len=%d)\n",
+    NS_TRACE("Net_Switch: UDP %d.%d.%d.%d:%d -> %d.%d.%d.%d:%d (len=%d)\n",
            srcIP >> 24, (srcIP >> 16) & 0xFF, (srcIP >> 8) & 0xFF, srcIP & 0xFF, srcPort,
            dstIP >> 24, (dstIP >> 16) & 0xFF, (dstIP >> 8) & 0xFF, dstIP & 0xFF, dstPort,
            udpLen);
@@ -1214,7 +1234,7 @@ void Net_Switch::HandleUDPFrame(u8* ipHeader, int ipLen)
     // Handle DHCP (port 67) - accept any source port during DHCP
     if (dstPort == 67)
     {
-        printf("Net_Switch: DHCP packet detected (port 67)\n");
+        NS_TRACE("Net_Switch: DHCP packet detected (port 67)\n");
         HandleDHCPFrame(udp, udpLen, srcIP);
         return;
     }
@@ -1222,12 +1242,12 @@ void Net_Switch::HandleUDPFrame(u8* ipHeader, int ipLen)
     // Handle DNS (port 53) - forward to real DNS server
     if (dstPort == 53)
     {
-        printf("Net_Switch: DNS packet detected (port 53)\n");
+        NS_TRACE("Net_Switch: DNS packet detected (port 53)\n");
         HandleDNSFrame(udp + 8, dataLen, srcIP, srcPort);
         return;
     }
 
-    printf("Net_Switch: Generic UDP forwarding\n");
+    NS_TRACE("Net_Switch: Generic UDP forwarding\n");
     // Generic UDP forwarding to internet
     ForwardUDPPacket(srcIP, srcPort, dstIP, dstPort, udp + 8, dataLen);
 }
@@ -1266,7 +1286,7 @@ void Net_Switch::ForwardUDPPacket(u32 srcIP, u16 srcPort, u32 dstIP, u16 dstPort
         
         UDPConnections[key] = conn;
         
-        printf("Net_Switch: New UDP connection: %d -> %d.%d.%d.%d:%d\n",
+        NS_TRACE("Net_Switch: New UDP connection: %d -> %d.%d.%d.%d:%d\n",
                srcPort, (dstIP>>24)&0xFF, (dstIP>>16)&0xFF, (dstIP>>8)&0xFF, dstIP&0xFF, dstPort);
     }
     else
@@ -1288,7 +1308,7 @@ void Net_Switch::ForwardUDPPacket(u32 srcIP, u16 srcPort, u32 dstIP, u16 dstPort
     
     if (sent < 0)
     {
-        printf("Net_Switch: UDP send failed: %d\n", errno);
+        NS_ERR("Net_Switch: UDP send failed: %d\n", errno);
     }
     else
     {
@@ -1310,24 +1330,24 @@ int Net_Switch::SendPacket(u8* data, int len)
     {
         u16 ethertype = (data[12] << 8) | data[13];
         
-        printf("Net_Switch: Packet received - ethertype=0x%04X, len=%d\n", ethertype, len);
+        NS_TRACE("Net_Switch: Packet received - ethertype=0x%04X, len=%d\n", ethertype, len);
         
         switch (ethertype)
         {
         case 0x0806: // ARP
-            printf("Net_Switch: ARP packet\n");
+            NS_TRACE("Net_Switch: ARP packet\n");
             // Pass Ethernet frame with Ethernet header intact (ARP handler reads from offset 14)
             HandleARPFrame(data, len);
             break;
             
         case 0x0800: // IPv4
-            printf("Net_Switch: IPv4 packet\n");
+            NS_TRACE("Net_Switch: IPv4 packet\n");
             // Skip Ethernet header (14 bytes) and pass only IP portion
             HandleIPFrame(data + 14, len - 14);
             break;
 
         default:
-            printf("Net_Switch: Unknown ethertype 0x%04X\n", ethertype);
+            NS_TRACE("Net_Switch: Unknown ethertype 0x%04X\n", ethertype);
             break;
         }
     }
