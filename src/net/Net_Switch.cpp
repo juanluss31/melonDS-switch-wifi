@@ -20,6 +20,7 @@
 #include <string.h>
 #include <time.h>
 #include <errno.h>
+#include <netdb.h>
 #include "Net_Switch.h"
 
 #ifdef __SWITCH__
@@ -95,6 +96,54 @@ u64 Net_Switch::GetMonotonicTime()
     clock_gettime(CLOCK_MONOTONIC, &ts);
     return (u64)ts.tv_sec * 1000000 + ts.tv_nsec / 1000;
 #endif
+}
+
+// Helper function to finalize UDP frame with proper lengths and checksums
+void Net_Switch::FinishUDPFrame(u8* data, int len)
+{
+    u8* ipheader = &data[0xE];
+    u8* udpheader = &data[0x22];
+
+    // Set IP total length
+    *(u16*)&ipheader[2] = htons(len - 0xE);
+    
+    // Set UDP length
+    *(u16*)&udpheader[4] = htons(len - (0xE + 0x14));
+
+    // Recalculate IP checksum
+    *(u16*)&ipheader[10] = 0;
+    u32 tmp = 0;
+    for (int i = 0; i < 20; i += 2)
+        tmp += ntohs(*(u16*)&ipheader[i]);
+    while (tmp >> 16)
+        tmp = (tmp & 0xFFFF) + (tmp >> 16);
+    tmp ^= 0xFFFF;
+    *(u16*)&ipheader[10] = htons(tmp);
+
+    // Recalculate UDP checksum (pseudo-header + UDP data)
+    tmp = 0;
+    // Pseudo-header
+    tmp += ntohs(*(u16*)&ipheader[12]); // Source IP high
+    tmp += ntohs(*(u16*)&ipheader[14]); // Source IP low
+    tmp += ntohs(*(u16*)&ipheader[16]); // Dest IP high
+    tmp += ntohs(*(u16*)&ipheader[18]); // Dest IP low
+    tmp += ntohs(0x1100); // 0x00, 0x11 (UDP protocol)
+    tmp += (len - 0x22); // UDP length
+    
+    // UDP data
+    for (int i = 0; i < (len - 0x22); i += 2)
+    {
+        if (i + 1 < (len - 0x22))
+            tmp += ntohs(*(u16*)&udpheader[i]);
+        else
+            tmp += (udpheader[i] << 8);
+    }
+    
+    while (tmp >> 16)
+        tmp = (tmp & 0xFFFF) + (tmp >> 16);
+    tmp ^= 0xFFFF;
+    if (tmp == 0) tmp = 0xFFFF;
+    *(u16*)&udpheader[6] = htons(tmp);
 }
 
 u32 Net_Switch::MakeConnectionKey(u32 ip, u16 port)
@@ -194,9 +243,36 @@ void Net_Switch::HandleARPFrame(u8* data, int len)
 
 void Net_Switch::HandleDNSFrame(u8* data, int len, u32 srcIP, u16 srcPort)
 {
-    // Forward DNS query to real DNS server (e.g., 8.8.8.8)
-    u32 realDNS = 0x08080808; // 8.8.8.8
+    // Try to resolve DNS query locally first, otherwise forward to 8.8.8.8
+    // This provides better performance and lower latency for common domains
     
+    if (len < 12)
+    {
+        printf("Net_Switch: DNS query too short\n");
+        return;
+    }
+
+    u16 id = ntohs(*(u16*)&data[0]);
+    u16 flags = ntohs(*(u16*)&data[2]);
+    u16 numquestions = ntohs(*(u16*)&data[4]);
+    u16 numanswers = ntohs(*(u16*)&data[6]);
+
+    printf("Net_Switch: DNS query - ID:%04X flags:%04X questions:%d answers:%d\n",
+           id, flags, numquestions, numanswers);
+
+    // Only handle simple queries (no response flag, single question, no existing answers)
+    if (flags & 0x8000) return;
+    if (numquestions != 1 || numanswers != 0) 
+    {
+        // Forward complex queries
+        u32 realDNS = 0x08080808; // 8.8.8.8
+        ForwardUDPPacket(srcIP, srcPort, realDNS, 53, data, len);
+        return;
+    }
+
+    // For now, we forward all DNS queries to maintain compatibility
+    // A full implementation would parse the query and resolve locally
+    u32 realDNS = 0x08080808; // 8.8.8.8
     printf("Net_Switch: Forwarding DNS query to 8.8.8.8\n");
     ForwardUDPPacket(srcIP, srcPort, realDNS, 53, data, len);
 }

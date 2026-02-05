@@ -106,6 +106,7 @@ private:
     void SendTCPPacket(u32 srcIP, u16 srcPort, u32 dstIP, u16 dstPort, 
                        u32 seq, u32 ack, u8 flags, u8* data, int len);
     void SendICMPPacket(u32 srcIP, u32 dstIP, u8 type, u8 code, u8* data, int len);
+    void FinishUDPFrame(u8* data, int len);
 
     // Utility functions
     u16 IPChecksum(u8* data, int len);
