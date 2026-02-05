@@ -602,8 +602,10 @@ void Net_Switch::ProcessTCPConnections()
                     close(conn.socket);
                     eraseConn = true;
                 }
-                // Check if socket is ready for writing (connection established)
-                else if (pollIndex >= 0 && (pollfds[pollIndex].revents & POLLOUT))
+                // Check if socket is ready for writing (connection established) via POLLOUT
+                // OR periodically via getsockopt() fallback (every 100ms) for platforms where POLLOUT is unreliable
+                else if (pollIndex >= 0 && ((pollfds[pollIndex].revents & POLLOUT) || 
+                         (CurrentTime - conn.connectStartTime > 100000 && CurrentTime - conn.lastActivity > 100000)))
                 {
                     int err = 0;
                     socklen_t errLen = sizeof(err);
@@ -637,8 +639,10 @@ void Net_Switch::ProcessTCPConnections()
                         printf("Net_Switch: TCP backend connect error (errno=%d)\n", err);
                         SendTCPPacket(conn.destIP, conn.destPort, conn.clientIP, conn.clientPort,
                                       conn.serverSeqNext, conn.clientSeq, 0x14, nullptr, 0); // RST+ACK
+                        close(conn.socket);
                         eraseConn = true;
                     }
+                    conn.lastActivity = CurrentTime;
                 }
             }
 
