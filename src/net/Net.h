@@ -21,6 +21,7 @@
 
 #include <memory>
 #include "../types.h"
+#include "../Savestate.h"
 #include "PacketDispatcher.h"
 #include "NetDriver.h"
 

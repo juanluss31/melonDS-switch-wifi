@@ -20,6 +20,7 @@
 #define NET_SWITCH_H
 
 #include "../types.h"
+#include "../Savestate.h"
 #include "../FIFO.h"
 #include "NetDriver.h"
 #include <functional>

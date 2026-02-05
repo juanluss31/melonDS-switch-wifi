@@ -1,0 +1,52 @@
+name: Build melonDS for Nintendo Switch
+
+on:
+  push:
+    branches: [ switch-new ]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    container:
+      image: devkitpro/devkita64:latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v3
+        with:
+          submodules: recursive
+
+      - name: Create build directory
+        run: |
+          mkdir -p build
+          cd build
+
+      - name: Configure CMake
+        run: |
+          cd build
+          cmake .. \
+            -DENABLE_OGLRENDERER=OFF \
+            -DBUILD_QT_SDL=OFF \
+            -DCMAKE_TOOLCHAIN_FILE=../cmake/Toolchain-cross-Switch.cmake \
+            -DCMAKE_BUILD_TYPE=Release
+
+      - name: Build
+        run: |
+          cd build
+          make -j$(nproc --all)
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v3
+        with:
+          name: melonDS-nro
+          path: build/melonDS.nro
+          if-no-files-found: warn
+
+      - name: Create Release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v1
+        with:
+          files: build/melonDS.nro
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

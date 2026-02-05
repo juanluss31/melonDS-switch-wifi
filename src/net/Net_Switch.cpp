@@ -160,8 +160,7 @@ void Net_Switch::RecvCheck()
     // Process any queued packets in RXBuffer
     while (!RXBuffer.IsEmpty())
     {
-        u32 entry;
-        RXBuffer.Read(entry);
+        u32 entry = RXBuffer.Read();
         
         // Process packet data
         // This would typically involve reading from a packet buffer

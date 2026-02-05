@@ -20,6 +20,7 @@
 #define PACKETDISPATCHER_H
 
 #include "../types.h"
+#include "../Savestate.h"
 #include "../FIFO.h"
 
 class PacketDispatcher

@@ -74,8 +74,7 @@ bool PacketDispatcher::recvPacket(u8* header, int* headerlen, u8* data, int* len
 {
     if (PacketQueue.IsEmpty()) return false;
 
-    Packet pkt;
-    if (!PacketQueue.Read(pkt)) return false;
+    Packet pkt = PacketQueue.Read();
 
     if (!(pkt.DestMask & (1 << instancenum)))
     {
