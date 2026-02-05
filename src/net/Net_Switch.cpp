@@ -978,16 +978,25 @@ void Net_Switch::HandleTCPFrame(u8* ipHeader, int ipLen)
 
             if (dataLen > 0)
             {
+                printf("Net_Switch: TCP client sent %d bytes (seq=%u)\n", dataLen, seqNum);
                 if (conn.socket >= 0)
                 {
                     if (conn.connected)
                     {
-                        ssize_t sent = send(conn.socket, payload, dataLen, 0);
-                        if (sent < 0 && errno != EWOULDBLOCK && errno != EAGAIN)
-                            printf("Net_Switch: TCP send failed (errno=%d)\n", errno);
+                        ssize_t sent = send(conn.socket, payload, dataLen, MSG_DONTWAIT);
+                        if (sent < 0)
+                        {
+                            if (errno != EWOULDBLOCK && errno != EAGAIN)
+                                printf("Net_Switch: TCP forward send failed (errno=%d)\n", errno);
+                        }
+                        else
+                        {
+                            printf("Net_Switch: TCP forwarded %zd bytes to backend\n", sent);
+                        }
                     }
                     else
                     {
+                        printf("Net_Switch: TCP buffering %d bytes (not connected yet)\n", dataLen);
                         conn.recvBuffer.insert(conn.recvBuffer.end(), payload, payload + dataLen);
                     }
                 }
