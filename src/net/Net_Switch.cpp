@@ -207,23 +207,39 @@ u16 Net_Switch::UDPChecksum(u32 srcIP, u32 dstIP, u8* udpData, int udpLen)
 
 void Net_Switch::HandleARPFrame(u8* data, int len)
 {
-    // Basic ARP handling - respond to ARP requests
-    if (len < 28) return;
+    // ARP packet format (Ethernet frame):
+    // Offset 0-13: Ethernet header
+    // Offset 14-15: Hardware type (0x0001 = Ethernet)
+    // Offset 16-17: Protocol type (0x0800 = IPv4)
+    // Offset 18: Hardware address length (6 for Ethernet)
+    // Offset 19: Protocol address length (4 for IPv4)
+    // Offset 20-21: Operation (1 = request, 2 = reply)
+    // Offset 22-27: Sender MAC
+    // Offset 28-31: Sender IP
+    // Offset 32-37: Target MAC
+    // Offset 38-41: Target IP
+    
+    if (len < 42) return; // Ethernet header (14) + ARP header (28)
 
-    u16 protocol = (data[2] << 8) | data[3];
+    // Read protocol type from ARP header
+    u16 protocol = (data[16] << 8) | data[17];
     if (protocol != 0x0800) return; // Only handle IPv4
 
-    u16 op = (data[6] << 8) | data[7];
+    // Read operation from ARP header
+    u16 op = (data[20] << 8) | data[21];
     if (op != 1) return; // Only handle requests
+
+    printf("Net_Switch: ARP Request for %d.%d.%d.%d\n",
+           data[38], data[39], data[40], data[41]);
 
     // Build ARP reply
     u8 reply[64];
     memset(reply, 0, sizeof(reply));
 
     // Ethernet header
-    memcpy(&reply[0], &data[8+6], 6); // dest MAC = sender MAC from ARP
+    memcpy(&reply[0], &data[6], 6); // dest MAC = sender MAC from Ethernet
     memcpy(&reply[6], kServerMAC, 6); // src MAC = our MAC
-    reply[12] = 0x08; reply[13] = 0x06; // ARP
+    reply[12] = 0x08; reply[13] = 0x06; // EtherType = ARP
 
     // ARP header
     reply[14] = 0x00; reply[15] = 0x01; // Hardware type: Ethernet
@@ -232,11 +248,12 @@ void Net_Switch::HandleARPFrame(u8* data, int len)
     reply[19] = 4; // Protocol size
     reply[20] = 0x00; reply[21] = 0x02; // Opcode: Reply
 
-    memcpy(&reply[22], kServerMAC, 6); // Sender MAC
-    memcpy(&reply[28], &data[8+14], 4); // Sender IP (target IP from request)
-    memcpy(&reply[32], &data[8+6], 6); // Target MAC
-    memcpy(&reply[38], &data[8+10], 4); // Target IP (sender IP from request)
+    memcpy(&reply[22], kServerMAC, 6); // Sender MAC (our MAC)
+    memcpy(&reply[28], &data[38], 4); // Sender IP (target IP from request)
+    memcpy(&reply[32], &data[22], 6); // Target MAC (sender MAC from request)
+    memcpy(&reply[38], &data[28], 4); // Target IP (sender IP from request)
 
+    printf("Net_Switch: Sending ARP Reply\n");
     if (Callback)
         Callback(reply, 42);
 }
