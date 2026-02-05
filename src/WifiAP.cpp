@@ -149,7 +149,10 @@ int HandleManagementFrame(u8* data, int len)
 
     if (RXNum)
     {
+        // This can happen a lot under load; avoid nxlink stalls on Switch.
+    #if !defined(__SWITCH__)
         printf("wifiAP: can't reply!!\n");
+    #endif
         return 0;
     }
 
@@ -285,7 +288,10 @@ int HandleManagementFrame(u8* data, int len)
         return len;
 
     default:
+        // Can be noisy depending on what the guest sends.
+#if !defined(__SWITCH__)
         printf("wifiAP: unknown management frame type %X\n", (framectl>>4)&0xF);
+#endif
         return 0;
     }
 }
@@ -309,7 +315,9 @@ int SendPacket(u8* data, int len)
         {
             if ((framectl & 0x0300) != 0x0100)
             {
+#if !defined(__SWITCH__)
                 printf("wifiAP: got data frame with bad fromDS/toDS bits %04X\n", framectl);
+#endif
                 return 0;
             }
 
@@ -319,7 +327,9 @@ int SendPacket(u8* data, int len)
             {
                 if (ClientStatus != 2)
                 {
+#if !defined(__SWITCH__)
                     printf("wifiAP: trying to send shit without being associated\n");
+#endif
                     return 0;
                 }
 

@@ -1109,6 +1109,9 @@ void Net_Switch::HandleTCPFrame(u8* ipHeader, int ipLen)
             TCPConnection& conn = it->second;
             conn.lastActivity = CurrentTime;
 
+            const bool hasPayload = (dataLen > 0);
+            const bool isPureAck = isACK && !hasPayload && !isFIN && !isSYN;
+
             // Track ACKs during close handshake even when combined with FIN.
             if (isACK)
             {
@@ -1157,11 +1160,16 @@ void Net_Switch::HandleTCPFrame(u8* ipHeader, int ipLen)
                     conn.serverFinAcked = true;
             }
 
-            // Send ACK for this packet - acknowledge the sequence number + data length
+            // Only send an ACK when we actually need to acknowledge data/FIN.
+            // Do not reply to pure ACKs (TCP does not ACK an ACK), which reduces traffic
+            // and avoids pathological ACK ping-pong with some servers/clients.
             u32 responseSeq = conn.serverSeqNext;
             u32 responseAck = conn.clientSeq;
-            NS_TRACE("Net_Switch: Sending TCP ACK\n");
-            SendTCPPacket(dstIP, dstPort, srcIP, srcPort, responseSeq, responseAck, 0x10, nullptr, 0);
+            if (!isPureAck)
+            {
+                NS_TRACE("Net_Switch: Sending TCP ACK\n");
+                SendTCPPacket(dstIP, dstPort, srcIP, srcPort, responseSeq, responseAck, 0x10, nullptr, 0);
+            }
             
             // If FIN, send FIN-ACK but don't erase immediately if backend is connecting
             // Let ProcessTCPConnections clean it up after backend connect completes/fails
@@ -1303,7 +1311,7 @@ void Net_Switch::ForwardUDPPacket(u32 srcIP, u16 srcPort, u32 dstIP, u16 dstPort
     addr.sin_addr.s_addr = htonl(dstIP);
     addr.sin_port = htons(dstPort);
     
-    ssize_t sent = sendto(UDPConnections[key].socket, data, len, 0, 
+    ssize_t sent = sendto(UDPConnections[key].socket, data, len, MSG_DONTWAIT, 
                           (struct sockaddr*)&addr, sizeof(addr));
     
     if (sent < 0)

@@ -17,6 +17,16 @@
 */
 
 #include <stdio.h>
+#ifndef SWITCH_WIFI_VERBOSE_LOG
+#define SWITCH_WIFI_VERBOSE_LOG 0
+#endif
+
+#if defined(__SWITCH__) && !SWITCH_WIFI_VERBOSE_LOG
+#define WIFI_TRACE_PRINTF(...) ((void)0)
+#else
+#define WIFI_TRACE_PRINTF(...) printf(__VA_ARGS__)
+#endif
+
 #include <string.h>
 #include "NDS.h"
 #include "SPI.h"
@@ -1313,7 +1323,7 @@ void Write(u32 addr, u16 val)
         return;
     case W_IFSet:
         IOPORT(W_IF) |= (val & 0xFBFF);
-        printf("wifi: force-setting IF %04X\n", val);
+        WIFI_TRACE_PRINTF("wifi: force-setting IF %04X\n", val);
         return;
 
     case W_PowerState:
@@ -1329,7 +1339,7 @@ void Write(u32 addr, u16 val)
         }
         return;
     case W_PowerForce:
-        if ((val&0x8001)==0x8000) printf("WIFI: forcing power %04X\n", val);
+        if ((val&0x8001)==0x8000) WIFI_TRACE_PRINTF("WIFI: forcing power %04X\n", val);
         val &= 0x8001;
         if (val == 0x8001)
         {
