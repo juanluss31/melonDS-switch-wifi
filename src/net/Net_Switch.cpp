@@ -520,11 +520,17 @@ void Net_Switch::ProcessTCPConnections()
         {
             if (conn.connecting)
             {
-                int err = 0;
-                socklen_t errLen = sizeof(err);
-                if (getsockopt(conn.socket, SOL_SOCKET, SO_ERROR, &err, &errLen) == 0)
+                // Check if socket is ready for writing (connection established)
+                struct pollfd pfd;
+                pfd.fd = conn.socket;
+                pfd.events = POLLOUT;
+                pfd.revents = 0;
+                
+                if (poll(&pfd, 1, 0) > 0 && (pfd.revents & POLLOUT))
                 {
-                    if (err == 0)
+                    int err = 0;
+                    socklen_t errLen = sizeof(err);
+                    if (getsockopt(conn.socket, SOL_SOCKET, SO_ERROR, &err, &errLen) == 0 && err == 0)
                     {
                         conn.connecting = false;
                         conn.connected = true;
@@ -535,10 +541,12 @@ void Net_Switch::ProcessTCPConnections()
                             ssize_t sent = send(conn.socket, conn.recvBuffer.data(), conn.recvBuffer.size(), 0);
                             if (sent < 0 && errno != EWOULDBLOCK && errno != EAGAIN)
                                 printf("Net_Switch: TCP buffered send failed (errno=%d)\n", errno);
+                            else if (sent >= 0)
+                                printf("Net_Switch: TCP sent %zd buffered bytes\n", sent);
                             conn.recvBuffer.clear();
                         }
                     }
-                    else
+                    else if (err != 0)
                     {
                         printf("Net_Switch: TCP backend connect error (errno=%d)\n", err);
                         SendTCPPacket(conn.destIP, conn.destPort, conn.clientIP, conn.clientPort,
