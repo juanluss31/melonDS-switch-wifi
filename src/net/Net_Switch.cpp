@@ -432,14 +432,13 @@ void Net_Switch::CleanupOldConnections()
 
 void Net_Switch::HandleDHCPFrame(u8* data, int len, u32 srcIP)
 {
-    // DHCP packet structure:
-    // UDP header at data[0..7]
-    // DHCP starts at data[8]
-    // DHCP: op(1) htype(1) hlen(1) hops(1) xid(4) secs(2) flags(2) ciaddr(4) yiaddr(4) siaddr(4) giaddr(4) chaddr(16) ...
+    // DHCP packet structure (after UDP header which is 8 bytes):
+    // DHCP fixed: op(1) htype(1) hlen(1) hops(1) xid(4) secs(2) flags(2) ciaddr(4) yiaddr(4) siaddr(4) giaddr(4) chaddr(16) sname(64) file(128) = 236 bytes
+    // Then: magic cookie(4) + options(variable)
     
-    if (len < 8 + 236) return; // UDP header + minimal DHCP
+    if (len < 8 + 236) return; // UDP header + minimal DHCP fixed header
     
-    u8* dhcp = &data[8];
+    u8* dhcp = &data[8]; // Skip UDP header
     u8 op = dhcp[0];
     if (op != 1) return; // Only handle BOOTREQUEST
     
@@ -448,32 +447,32 @@ void Net_Switch::HandleDHCPFrame(u8* data, int len, u32 srcIP)
     memcpy(clientMAC, &dhcp[28], 6);
     
     // Check DHCP message type (option 53)
-    // Skip to options: 236 bytes of fixed DHCP header + 4 bytes magic cookie
+    // Magic cookie is at offset 236 from start of DHCP
     int dhcpMsgType = 0;
-    int optStart = 8 + 236 + 4;
+    int optStart = 236 + 4; // Fixed DHCP header + magic cookie
     
-    // Verify magic cookie (0x63825363 = 99.130.83.99)
-    if (len < optStart || 
-        data[optStart-4] != 99 || data[optStart-3] != 130 || 
-        data[optStart-2] != 83 || data[optStart-1] != 99)
+    // Verify magic cookie (0x63825363 = 99.130.83.99) at DHCP offset 236
+    if (len < 8 + optStart || 
+        dhcp[236] != 99 || dhcp[237] != 130 || 
+        dhcp[238] != 83 || dhcp[239] != 99)
     {
-        printf("DHCP: invalid magic cookie\n");
+        printf("DHCP: invalid magic cookie at offset 236\n");
         return;
     }
     
-    for (int i = optStart; i < len && i < optStart + 200; )
+    for (int i = optStart; i < len && i < 8 + optStart + 200; )
     {
-        if (data[i] == 0xFF) break; // End option
-        if (data[i] == 0x00) { i++; continue; } // Padding
+        if (dhcp[i] == 0xFF) break; // End option
+        if (dhcp[i] == 0x00) { i++; continue; } // Padding
         
-        u8 optType = data[i++];
-        if (i >= len) break;
-        u8 optLen = data[i++];
-        if (i + optLen > len) break;
+        u8 optType = dhcp[i++];
+        if (i >= len - 8) break;
+        u8 optLen = dhcp[i++];
+        if (i + optLen > len - 8) break;
         
         if (optType == 53 && optLen == 1) // DHCP Message Type
         {
-            dhcpMsgType = data[i];
+            dhcpMsgType = dhcp[i];
             break;
         }
         i += optLen;
@@ -499,7 +498,7 @@ void Net_Switch::HandleDHCPFrame(u8* data, int len, u32 srcIP)
     *p++ = 0x00; // DSCP/ECN
     u16 ipLen = 20 + 8 + 300; // IP + UDP + DHCP (approximate)
     *p++ = (ipLen >> 8); *p++ = (ipLen & 0xFF);
-    *p++ = 0x00; *p++ = 0x01; // ID
+    *p++ = (IPv4ID >> 8); *p++ = (IPv4ID & 0xFF); IPv4ID++;
     *p++ = 0x00; *p++ = 0x00; // Flags/Fragment
     *p++ = 0x80; // TTL
     *p++ = 0x11; // Protocol (UDP)
@@ -509,6 +508,7 @@ void Net_Switch::HandleDHCPFrame(u8* data, int len, u32 srcIP)
     *p++ = 0xFF; *p++ = 0xFF; *p++ = 0xFF; *p++ = 0xFF; // Dest IP (broadcast)
     
     // UDP header
+    u8* udphdr = p;
     *p++ = 0x00; *p++ = 67; // Source port (DHCP server)
     *p++ = 0x00; *p++ = 68; // Dest port (DHCP client)
     u16 udpLen = 8 + 300; // UDP header + DHCP payload
@@ -562,16 +562,16 @@ void Net_Switch::HandleDHCPFrame(u8* data, int len, u32 srcIP)
     
     *p++ = 0xFF; // End
     
-    // Update IP length
+    // Update IP length (from after Ethernet header to end)
     int finalLen = (p - reply);
     ipLen = finalLen - 14; // Minus Ethernet header
     iphdr[2] = (ipLen >> 8);
     iphdr[3] = (ipLen & 0xFF);
     
-    // Update UDP length
-    udpLen = ipLen - 20; // Minus IP header
-    iphdr[20 + 4] = (udpLen >> 8);
-    iphdr[20 + 5] = (udpLen & 0xFF);
+    // Update UDP length (from UDP header to end)
+    udpLen = finalLen - 14 - 20; // Minus Ethernet and IP headers
+    udphdr[4] = (udpLen >> 8);
+    udphdr[5] = (udpLen & 0xFF);
     
     // Calculate IP checksum
     iphdr[10] = 0;
