@@ -103,6 +103,14 @@ void LAN_DeInit();
 int LAN_SendPacket(u8* data, int len);
 int LAN_RecvPacket(u8* data);
 
+// Network interface
+// New unified network interface for internet connectivity
+int Net_SendPacket(u8* data, int len);
+int Net_RecvPacket(u8* data);
+
+// Callback type for packet reception
+using SendPacketCallback = std::function<void(const u8* data, int len)>;
+
 void Sleep(u64 usecs);
 
 }

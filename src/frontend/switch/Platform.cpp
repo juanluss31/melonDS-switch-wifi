@@ -3,11 +3,51 @@
 #include <assert.h>
 
 #include "../../Platform.h"
+#include "../../net/Net.h"
+#include "../../net/Net_Switch.h"
+#include <memory>
 
 #include <switch.h>
 
 namespace Platform
 {
+
+// Network instance
+static std::unique_ptr<Net> netInstance;
+static bool netInitialized = false;
+
+void InitNet()
+{
+    if (!netInitialized)
+    {
+        netInstance = std::make_unique<Net>();
+        
+        // Create Switch network driver
+        auto netDriver = std::make_unique<Net_Switch>([](const u8* data, int len) {
+            if (netInstance)
+                netInstance->RXEnqueue(data, len);
+        });
+        
+        netInstance->SetDriver(std::move(netDriver));
+        netInstance->RegisterInstance(0); // Register default instance
+        
+        netInitialized = true;
+    }
+}
+
+void DeInitNet()
+{
+    if (netInitialized)
+    {
+        if (netInstance)
+        {
+            netInstance->UnregisterInstance(0);
+            netInstance.reset();
+        }
+        netInitialized = false;
+    }
+}
+
 
 void StopEmu()
 {
@@ -195,20 +235,45 @@ int MP_RecvPacket(u8* data, bool block)
 
 bool LAN_Init()
 {
-    return false;
+    InitNet();
+    return netInitialized;
 }
 
 void LAN_DeInit()
-{}
+{
+    // Keep network alive as it might be used by other components
+}
 
 int LAN_SendPacket(u8* data, int len)
 {
-    return 0;
+    if (!netInitialized || !netInstance)
+        return 0;
+    
+    return netInstance->SendPacket(data, len, 0);
 }
 
 int LAN_RecvPacket(u8* data)
 {
-    return 0;
+    if (!netInitialized || !netInstance)
+        return 0;
+    
+    return netInstance->RecvPacket(data, 0);
+}
+
+int Net_SendPacket(u8* data, int len)
+{
+    if (!netInitialized || !netInstance)
+        return 0;
+    
+    return netInstance->SendPacket(data, len, 0);
+}
+
+int Net_RecvPacket(u8* data)
+{
+    if (!netInitialized || !netInstance)
+        return 0;
+    
+    return netInstance->RecvPacket(data, 0);
 }
 
 }

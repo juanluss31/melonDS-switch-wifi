@@ -47,6 +47,10 @@ add_library(core STATIC
 	Wifi.cpp
 	WifiAP.cpp
 
+	net/Net.cpp
+	net/Net_Switch.cpp
+	net/PacketDispatcher.cpp
+
 	tiny-AES-c/aes.c
 	xxhash/xxhash.c
 )
