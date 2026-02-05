@@ -616,9 +616,16 @@ void Net_Switch::HandleIPFrame(u8* data, int len)
     u32 srcIP = ntohl(*(u32*)&data[12]);
     u32 dstIP = ntohl(*(u32*)&data[16]);
     
+    printf("Net_Switch: IP packet - protocol %d, %d.%d.%d.%d -> %d.%d.%d.%d.%d (len=%d)\n",
+           protocol,
+           srcIP >> 24, (srcIP >> 16) & 0xFF, (srcIP >> 8) & 0xFF, srcIP & 0xFF,
+           dstIP >> 24, (dstIP >> 16) & 0xFF, (dstIP >> 8) & 0xFF, dstIP & 0xFF,
+           len);
+    
     // Handle UDP packets
     if (protocol == 0x11) // UDP
     {
+        printf("Net_Switch: UDP detected (protocol 0x11)\n");
         HandleUDPFrame(data, len);
         return;
     }
@@ -686,9 +693,15 @@ void Net_Switch::HandleUDPFrame(u8* ipHeader, int ipLen)
     int dataLen = udpLen - 8;
     if (dataLen < 0 || ihl + udpLen > ipLen) return;
 
-    // Handle DHCP (port 67)
-    if (dstPort == 67 && srcPort == 68)
+    printf("Net_Switch: UDP %d.%d.%d.%d:%d -> %d.%d.%d.%d:%d (len=%d)\n",
+           srcIP >> 24, (srcIP >> 16) & 0xFF, (srcIP >> 8) & 0xFF, srcIP & 0xFF, srcPort,
+           dstIP >> 24, (dstIP >> 16) & 0xFF, (dstIP >> 8) & 0xFF, dstIP & 0xFF, dstPort,
+           udpLen);
+
+    // Handle DHCP (port 67) - accept any source port during DHCP
+    if (dstPort == 67)
     {
+        printf("Net_Switch: DHCP packet detected (port 67)\n");
         HandleDHCPFrame(udp, udpLen, srcIP);
         return;
     }
@@ -696,10 +709,12 @@ void Net_Switch::HandleUDPFrame(u8* ipHeader, int ipLen)
     // Handle DNS (port 53) - forward to real DNS server
     if (dstPort == 53)
     {
+        printf("Net_Switch: DNS packet detected (port 53)\n");
         HandleDNSFrame(udp + 8, dataLen, srcIP, srcPort);
         return;
     }
 
+    printf("Net_Switch: Generic UDP forwarding\n");
     // Generic UDP forwarding to internet
     ForwardUDPPacket(srcIP, srcPort, dstIP, dstPort, udp + 8, dataLen);
 }
@@ -781,14 +796,22 @@ int Net_Switch::SendPacket(u8* data, int len)
     {
         u16 ethertype = (data[12] << 8) | data[13];
         
+        printf("Net_Switch: Packet received - ethertype=0x%04X, len=%d\n", ethertype, len);
+        
         switch (ethertype)
         {
         case 0x0806: // ARP
+            printf("Net_Switch: ARP packet\n");
             HandleARPFrame(data, len);
             break;
             
         case 0x0800: // IPv4
+            printf("Net_Switch: IPv4 packet\n");
             HandleIPFrame(data, len);
+            break;
+
+        default:
+            printf("Net_Switch: Unknown ethertype 0x%04X\n", ethertype);
             break;
         }
     }
