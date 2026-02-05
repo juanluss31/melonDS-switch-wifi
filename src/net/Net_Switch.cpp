@@ -519,15 +519,16 @@ void Net_Switch::ProcessTCPConnections()
     if (TCPConnections.empty())
         return;
 
-    // Log how many connections we're processing
+    // Log occasionally for debugging (every ~60 frames = 1 second)
+    static int logCounter = 0;
     int connectingCount = 0;
     for (auto& pair : TCPConnections)
     {
         if (pair.second.connecting)
             connectingCount++;
     }
-    if (connectingCount > 0)
-        printf("Net_Switch: ProcessTCPConnections - %d total, %d connecting\n", 
+    if (connectingCount > 0 && (++logCounter % 60 == 0))
+        printf("Net_Switch: ProcessTCPConnections - %d total, %d connecting (waiting...)\n", 
                (int)TCPConnections.size(), connectingCount);
 
     // Build pollfd array for all TCP sockets
@@ -585,15 +586,17 @@ void Net_Switch::ProcessTCPConnections()
         {
             if (conn.connecting)
             {
-                // Log poll status for connecting socket
-                if (pollIndex >= 0)
+                // Check for connection timeout (5 seconds)
+                if (CurrentTime - conn.connectStartTime > 5000000)
                 {
-                    printf("Net_Switch: Checking connecting socket port %d, revents=0x%x (POLLOUT=0x%x)\n",
-                           conn.clientPort, pollfds[pollIndex].revents, POLLOUT);
+                    printf("Net_Switch: TCP connection timeout for port %d after 5 seconds\n", conn.clientPort);
+                    SendTCPPacket(conn.destIP, conn.destPort, conn.clientIP, conn.clientPort,
+                                  conn.serverSeqNext, conn.clientSeq, 0x14, nullptr, 0); // RST+ACK
+                    close(conn.socket);
+                    eraseConn = true;
                 }
-                
                 // Check if socket is ready for writing (connection established)
-                if (pollIndex >= 0 && (pollfds[pollIndex].revents & POLLOUT))
+                else if (pollIndex >= 0 && (pollfds[pollIndex].revents & POLLOUT))
                 {
                     int err = 0;
                     socklen_t errLen = sizeof(err);
@@ -1035,6 +1038,7 @@ void Net_Switch::HandleTCPFrame(u8* ipHeader, int ipLen)
             conn.clientSeq = responseAck;
             conn.serverSeqNext = responseSeq + 1;
             conn.lastActivity = CurrentTime;
+            conn.connectStartTime = CurrentTime;
             conn.connecting = connecting;
             conn.recvBuffer.clear();
             TCPConnections[key] = conn;

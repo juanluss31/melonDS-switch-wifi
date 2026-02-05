@@ -62,6 +62,7 @@ private:
         u32 clientSeq;
         u32 serverSeqNext;
         u64 lastActivity;
+        u64 connectStartTime; // When connect() was initiated
         bool connecting;
         std::vector<u8> recvBuffer;
     };
