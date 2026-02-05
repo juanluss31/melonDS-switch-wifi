@@ -1081,14 +1081,21 @@ void Net_Switch::HandleTCPFrame(u8* ipHeader, int ipLen)
             printf("Net_Switch: Sending TCP ACK\n");
             SendTCPPacket(dstIP, dstPort, srcIP, srcPort, responseSeq, responseAck, 0x10, nullptr, 0);
             
-            // If FIN, also close the connection
+            // If FIN, send FIN-ACK but don't erase immediately if backend is connecting
+            // Let ProcessTCPConnections clean it up after backend connect completes/fails
             if (isFIN)
             {
                 printf("Net_Switch: Sending FIN-ACK in response\n");
                 SendTCPPacket(dstIP, dstPort, srcIP, srcPort, responseSeq, responseAck, 0x11, nullptr, 0);
-                if (conn.socket >= 0)
-                    close(conn.socket);
-                TCPConnections.erase(it);
+                
+                // Only erase if backend is already connected or has no socket
+                if (!conn.connecting || conn.socket < 0)
+                {
+                    if (conn.socket >= 0)
+                        close(conn.socket);
+                    TCPConnections.erase(it);
+                }
+                // If still connecting, mark for later cleanup but keep trying to connect
             }
         }
     }
