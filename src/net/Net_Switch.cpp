@@ -515,6 +515,9 @@ void Net_Switch::ProcessUDPConnections()
 void Net_Switch::ProcessTCPConnections()
 {
 #ifdef __SWITCH__
+    if (!TCPConnections.empty())
+        printf("Net_Switch: ProcessTCPConnections - checking %zu connections\n", TCPConnections.size());
+    
     for (auto it = TCPConnections.begin(); it != TCPConnections.end(); )
     {
         TCPConnection& conn = it->second;
@@ -530,7 +533,13 @@ void Net_Switch::ProcessTCPConnections()
                 pfd.events = POLLOUT;
                 pfd.revents = 0;
                 
-                if (poll(&pfd, 1, 0) > 0 && (pfd.revents & POLLOUT))
+                int pollResult = poll(&pfd, 1, 0);
+                if (pollResult < 0)
+                {
+                    printf("Net_Switch: poll() failed for port %d (errno=%d)\n", conn.clientPort, errno);
+                    eraseConn = true;
+                }
+                else if (pollResult > 0 && (pfd.revents & POLLOUT))
                 {
                     int err = 0;
                     socklen_t errLen = sizeof(err);
@@ -561,7 +570,9 @@ void Net_Switch::ProcessTCPConnections()
             }
 
             u8 buffer[2048];
+            printf("Net_Switch: About to recv on port %d socket %d\n", conn.clientPort, conn.socket);
             ssize_t received = recv(conn.socket, buffer, sizeof(buffer), MSG_DONTWAIT);
+            printf("Net_Switch: recv returned %zd (errno=%d)\n", received, errno);
             if (received > 0)
             {
                 printf("Net_Switch: TCP backend received %zd bytes, forwarding to client (seq=%u, ack=%u)\n", 
@@ -589,6 +600,7 @@ void Net_Switch::ProcessTCPConnections()
 
         if (eraseConn)
         {
+            printf("Net_Switch: Closing TCP connection on port %d\n", conn.clientPort);
             if (conn.socket >= 0)
                 close(conn.socket);
             it = TCPConnections.erase(it);
