@@ -101,11 +101,207 @@ void Net_Switch::HandleDNSFrame(u8* data, int len)
     // This is mainly to prevent crashes and provide basic functionality
 }
 
+void Net_Switch::HandleDHCPFrame(u8* data, int len)
+{
+    // DHCP packet structure:
+    // UDP header at data[0..7]
+    // DHCP starts at data[8]
+    // DHCP: op(1) htype(1) hlen(1) hops(1) xid(4) secs(2) flags(2) ciaddr(4) yiaddr(4) siaddr(4) giaddr(4) chaddr(16) ...
+    
+    if (len < 8 + 236) return; // UDP header + minimal DHCP
+    
+    u8* dhcp = &data[8];
+    u8 op = dhcp[0];
+    if (op != 1) return; // Only handle BOOTREQUEST
+    
+    u32 xid = (dhcp[4] << 24) | (dhcp[5] << 16) | (dhcp[6] << 8) | dhcp[7];
+    u8 clientMAC[6];
+    memcpy(clientMAC, &dhcp[28], 6);
+    
+    // Check DHCP message type (option 53)
+    // Skip to options: 236 bytes of fixed DHCP header + 4 bytes magic cookie
+    int dhcpMsgType = 0;
+    int optStart = 8 + 236 + 4;
+    
+    // Verify magic cookie (0x63825363 = 99.130.83.99)
+    if (len < optStart || 
+        data[optStart-4] != 99 || data[optStart-3] != 130 || 
+        data[optStart-2] != 83 || data[optStart-1] != 99)
+    {
+        printf("DHCP: invalid magic cookie\n");
+        return;
+    }
+    
+    for (int i = optStart; i < len && i < optStart + 200; )
+    {
+        if (data[i] == 0xFF) break; // End option
+        if (data[i] == 0x00) { i++; continue; } // Padding
+        
+        u8 optType = data[i++];
+        if (i >= len) break;
+        u8 optLen = data[i++];
+        if (i + optLen > len) break;
+        
+        if (optType == 53 && optLen == 1) // DHCP Message Type
+        {
+            dhcpMsgType = data[i];
+            break;
+        }
+        i += optLen;
+    }
+    
+    printf("DHCP: received message type %d from client (XID: %08X)\n", dhcpMsgType, xid);
+    
+    // Respond to DHCP Discover (1) and Request (3)
+    if (dhcpMsgType != 1 && dhcpMsgType != 3) return;
+    
+    u8 reply[1024];
+    memset(reply, 0, sizeof(reply));
+    u8* p = reply;
+    
+    // Ethernet header
+    memcpy(p, clientMAC, 6); p += 6; // Dest MAC
+    memcpy(p, kServerMAC, 6); p += 6; // Src MAC
+    *p++ = 0x08; *p++ = 0x00; // IPv4
+    
+    // IP header
+    u8* iphdr = p;
+    *p++ = 0x45; // Version 4, IHL 5
+    *p++ = 0x00; // DSCP/ECN
+    u16 ipLen = 20 + 8 + 300; // IP + UDP + DHCP (approximate)
+    *p++ = (ipLen >> 8); *p++ = (ipLen & 0xFF);
+    *p++ = 0x00; *p++ = 0x01; // ID
+    *p++ = 0x00; *p++ = 0x00; // Flags/Fragment
+    *p++ = 0x80; // TTL
+    *p++ = 0x11; // Protocol (UDP)
+    *p++ = 0x00; *p++ = 0x00; // Checksum (fill later)
+    *p++ = (kServerIP >> 24); *p++ = (kServerIP >> 16); 
+    *p++ = (kServerIP >> 8); *p++ = (kServerIP & 0xFF); // Source IP
+    *p++ = 0xFF; *p++ = 0xFF; *p++ = 0xFF; *p++ = 0xFF; // Dest IP (broadcast)
+    
+    // UDP header
+    *p++ = 0x00; *p++ = 67; // Source port (DHCP server)
+    *p++ = 0x00; *p++ = 68; // Dest port (DHCP client)
+    u16 udpLen = 8 + 300; // UDP header + DHCP payload
+    *p++ = (udpLen >> 8); *p++ = (udpLen & 0xFF);
+    *p++ = 0x00; *p++ = 0x00; // Checksum (optional for IPv4)
+    
+    // DHCP reply
+    *p++ = 0x02; // BOOTREPLY
+    *p++ = 0x01; // Ethernet
+    *p++ = 0x06; // Hardware address length
+    *p++ = 0x00; // Hops
+    *p++ = (xid >> 24); *p++ = (xid >> 16); 
+    *p++ = (xid >> 8); *p++ = (xid & 0xFF); // Transaction ID
+    *p++ = 0x00; *p++ = 0x00; // Secs
+    *p++ = 0x00; *p++ = 0x00; // Flags
+    *p++ = 0x00; *p++ = 0x00; *p++ = 0x00; *p++ = 0x00; // Client IP (0.0.0.0)
+    *p++ = (kClientIP >> 24); *p++ = (kClientIP >> 16);
+    *p++ = (kClientIP >> 8); *p++ = (kClientIP & 0xFF); // Your IP (assigned)
+    *p++ = (kServerIP >> 24); *p++ = (kServerIP >> 16);
+    *p++ = (kServerIP >> 8); *p++ = (kServerIP & 0xFF); // Server IP
+    *p++ = 0x00; *p++ = 0x00; *p++ = 0x00; *p++ = 0x00; // Gateway IP
+    memcpy(p, clientMAC, 6); p += 6; // Client MAC
+    memset(p, 0, 10); p += 10; // MAC padding
+    memset(p, 0, 64); p += 64; // Server hostname
+    memset(p, 0, 128); p += 128; // Boot filename
+    
+    // Magic cookie
+    *p++ = 99; *p++ = 130; *p++ = 83; *p++ = 99;
+    
+    // DHCP options
+    *p++ = 53; *p++ = 1; // DHCP Message Type
+    *p++ = (dhcpMsgType == 1) ? 2 : 5; // 2=OFFER, 5=ACK
+    
+    *p++ = 1; *p++ = 4; // Subnet Mask
+    *p++ = 0xFF; *p++ = 0xFF; *p++ = 0xFF; *p++ = 0x00;
+    
+    *p++ = 3; *p++ = 4; // Router
+    *p++ = (kServerIP >> 24); *p++ = (kServerIP >> 16);
+    *p++ = (kServerIP >> 8); *p++ = (kServerIP & 0xFF);
+    
+    *p++ = 6; *p++ = 4; // DNS Server
+    *p++ = (kDNSIP >> 24); *p++ = (kDNSIP >> 16);
+    *p++ = (kDNSIP >> 8); *p++ = (kDNSIP & 0xFF);
+    
+    *p++ = 51; *p++ = 4; // Lease Time
+    *p++ = 0x00; *p++ = 0x01; *p++ = 0x51; *p++ = 0x80; // 86400 seconds
+    
+    *p++ = 54; *p++ = 4; // DHCP Server Identifier
+    *p++ = (kServerIP >> 24); *p++ = (kServerIP >> 16);
+    *p++ = (kServerIP >> 8); *p++ = (kServerIP & 0xFF);
+    
+    *p++ = 0xFF; // End
+    
+    // Update IP length
+    int finalLen = (p - reply);
+    ipLen = finalLen - 14; // Minus Ethernet header
+    iphdr[2] = (ipLen >> 8);
+    iphdr[3] = (ipLen & 0xFF);
+    
+    // Update UDP length
+    udpLen = ipLen - 20; // Minus IP header
+    iphdr[20 + 4] = (udpLen >> 8);
+    iphdr[20 + 5] = (udpLen & 0xFF);
+    
+    // Calculate IP checksum
+    iphdr[10] = 0;
+    iphdr[11] = 0;
+    u16 checksum = IPChecksum(iphdr, 20);
+    iphdr[10] = (checksum >> 8);
+    iphdr[11] = (checksum & 0xFF);
+    
+    printf("DHCP: sending %s to client (IP: %d.%d.%d.%d)\n", 
+           (dhcpMsgType == 1) ? "OFFER" : "ACK",
+           (kClientIP >> 24) & 0xFF, (kClientIP >> 16) & 0xFF,
+           (kClientIP >> 8) & 0xFF, kClientIP & 0xFF);
+    
+    if (Callback)
+        Callback(reply, finalLen);
+}
+
+u16 Net_Switch::IPChecksum(u8* data, int len)
+{
+    u32 sum = 0;
+    for (int i = 0; i < len; i += 2)
+    {
+        if (i + 1 < len)
+            sum += (data[i] << 8) | data[i+1];
+        else
+            sum += data[i] << 8;
+    }
+    while (sum >> 16)
+        sum = (sum & 0xFFFF) + (sum >> 16);
+    return ~sum;
+}
+
 void Net_Switch::HandleIPFrame(u8* data, int len)
 {
     if (len < 20) return;
 
+    // Get IP header length (IHL field in first byte, lower 4 bits, in 32-bit words)
+    u8 ihl = (data[0] & 0x0F) * 4;
+    if (len < ihl) return;
+
     u8 protocol = data[9];
+    
+    // Handle UDP packets (for DHCP)
+    if (protocol == 0x11) // UDP
+    {
+        if (len < ihl + 8) return; // IP header + UDP header
+        
+        u16 srcPort = (data[ihl] << 8) | data[ihl+1];
+        u16 dstPort = (data[ihl+2] << 8) | data[ihl+3];
+        
+        printf("Net_Switch: UDP packet: src=%d dst=%d len=%d\n", srcPort, dstPort, len);
+        
+        // DHCP client->server (port 67)
+        if (dstPort == 67 && srcPort == 68)
+        {
+            HandleDHCPFrame(&data[ihl], len - ihl);
+            return;
+        }
+    }
     
     // For now, we mainly handle the frame reception
     // Actual protocol handling would need more complex implementation

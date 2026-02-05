@@ -55,6 +55,8 @@ private:
     void HandleARPFrame(u8* data, int len);
     void HandleIPFrame(u8* data, int len);
     void HandleDNSFrame(u8* data, int len);
+    void HandleDHCPFrame(u8* data, int len);
+    u16 IPChecksum(u8* data, int len);
 };
 
 #endif // NET_SWITCH_H
