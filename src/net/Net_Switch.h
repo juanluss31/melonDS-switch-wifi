@@ -69,6 +69,7 @@ private:
         u32 destIP;
         u16 destPort;
         u64 lastActivity;
+        bool isDNS; // Track if this is a DNS connection
     };
 
     SendPacketCallback Callback;

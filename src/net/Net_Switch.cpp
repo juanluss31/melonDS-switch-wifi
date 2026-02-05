@@ -284,6 +284,11 @@ void Net_Switch::HandleDNSFrame(u8* data, int len, u32 srcIP, u16 srcPort)
         // Forward complex queries
         u32 realDNS = 0x08080808; // 8.8.8.8
         ForwardUDPPacket(srcIP, srcPort, realDNS, 53, data, len);
+        // Mark the connection as DNS so responses are sent from 10.64.0.2
+        u32 key = MakeConnectionKey(srcIP, srcPort);
+        auto it = UDPConnections.find(key);
+        if (it != UDPConnections.end())
+            it->second.isDNS = true;
         return;
     }
 
@@ -292,6 +297,11 @@ void Net_Switch::HandleDNSFrame(u8* data, int len, u32 srcIP, u16 srcPort)
     u32 realDNS = 0x08080808; // 8.8.8.8
     printf("Net_Switch: Forwarding DNS query to 8.8.8.8\n");
     ForwardUDPPacket(srcIP, srcPort, realDNS, 53, data, len);
+    // Mark the connection as DNS so responses are sent from 10.64.0.2
+    u32 key = MakeConnectionKey(srcIP, srcPort);
+    auto it = UDPConnections.find(key);
+    if (it != UDPConnections.end())
+        it->second.isDNS = true;
 }
 
 void Net_Switch::SendUDPPacket(u32 srcIP, u16 srcPort, u32 dstIP, u16 dstPort, u8* data, int len)
@@ -414,10 +424,22 @@ void Net_Switch::ProcessUDPConnections()
         if (received > 0)
         {
             // Got data - send back to DS
-            u32 realSrcIP = ntohl(from.sin_addr.s_addr);
             u16 realSrcPort = ntohs(from.sin_port);
             
-            SendUDPPacket(realSrcIP, realSrcPort, conn.clientIP, conn.clientPort,
+            // For DNS, send response from virtual DNS server (10.64.0.2)
+            // For other UDP, send from the actual source IP
+            u32 responseSrcIP;
+            if (conn.isDNS)
+            {
+                responseSrcIP = kDNSIP; // 10.64.0.2
+                printf("Net_Switch: DNS response received, forwarding to client\n");
+            }
+            else
+            {
+                responseSrcIP = ntohl(from.sin_addr.s_addr);
+            }
+            
+            SendUDPPacket(responseSrcIP, realSrcPort, conn.clientIP, conn.clientPort,
                           buffer, received);
             
             conn.lastActivity = CurrentTime;
@@ -766,6 +788,7 @@ void Net_Switch::ForwardUDPPacket(u32 srcIP, u16 srcPort, u32 dstIP, u16 dstPort
         conn.destIP = dstIP;
         conn.destPort = dstPort;
         conn.lastActivity = GetMonotonicTime();
+        conn.isDNS = false; // Will be set to true by HandleDNSFrame if needed
         
         UDPConnections[key] = conn;
         
