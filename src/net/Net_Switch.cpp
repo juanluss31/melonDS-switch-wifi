@@ -519,6 +519,17 @@ void Net_Switch::ProcessTCPConnections()
     if (TCPConnections.empty())
         return;
 
+    // Log how many connections we're processing
+    int connectingCount = 0;
+    for (auto& pair : TCPConnections)
+    {
+        if (pair.second.connecting)
+            connectingCount++;
+    }
+    if (connectingCount > 0)
+        printf("Net_Switch: ProcessTCPConnections - %d total, %d connecting\n", 
+               (int)TCPConnections.size(), connectingCount);
+
     // Build pollfd array for all TCP sockets
     std::vector<struct pollfd> pollfds;
     std::vector<u16> portMap; // Map poll index to client port
@@ -1088,12 +1099,20 @@ void Net_Switch::HandleTCPFrame(u8* ipHeader, int ipLen)
                 printf("Net_Switch: Sending FIN-ACK in response\n");
                 SendTCPPacket(dstIP, dstPort, srcIP, srcPort, responseSeq, responseAck, 0x11, nullptr, 0);
                 
+                printf("Net_Switch: FIN received - conn.connecting=%d, conn.socket=%d\n", 
+                       conn.connecting, conn.socket);
+                
                 // Only erase if backend is already connected or has no socket
                 if (!conn.connecting || conn.socket < 0)
                 {
+                    printf("Net_Switch: Erasing connection (not connecting or no socket)\n");
                     if (conn.socket >= 0)
                         close(conn.socket);
                     TCPConnections.erase(it);
+                }
+                else
+                {
+                    printf("Net_Switch: Keeping connection alive (still connecting)\n");
                 }
                 // If still connecting, mark for later cleanup but keep trying to connect
             }
