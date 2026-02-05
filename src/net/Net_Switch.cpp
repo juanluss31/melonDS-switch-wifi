@@ -411,6 +411,10 @@ void Net_Switch::SendTCPPacket(u32 srcIP, u16 srcPort, u32 dstIP, u16 dstPort,
     tcpHeader[16] = (tcpChecksum >> 8);
     tcpHeader[17] = (tcpChecksum & 0xFF);
 
+    if (len > 0 || (flags & 0x08)) // Log if sending data or FIN
+        printf("Net_Switch: Sending TCP packet to client: len=%d, flags=0x%02x, seq=%u, ack=%u\n",
+               len, flags, seq, ack);
+
     if (Callback)
         Callback(packet, p - packet);
 }
@@ -560,7 +564,8 @@ void Net_Switch::ProcessTCPConnections()
             ssize_t received = recv(conn.socket, buffer, sizeof(buffer), MSG_DONTWAIT);
             if (received > 0)
             {
-                printf("Net_Switch: TCP backend received %zd bytes\n", received);
+                printf("Net_Switch: TCP backend received %zd bytes, forwarding to client (seq=%u, ack=%u)\n", 
+                       received, conn.serverSeqNext, conn.clientSeq);
                 SendTCPPacket(conn.destIP, conn.destPort, conn.clientIP, conn.clientPort,
                               conn.serverSeqNext, conn.clientSeq, 0x18, buffer, (int)received);
                 conn.serverSeqNext += (u32)received;
@@ -568,7 +573,8 @@ void Net_Switch::ProcessTCPConnections()
             }
             else if (received == 0)
             {
-                printf("Net_Switch: TCP backend closed connection\n");
+                printf("Net_Switch: TCP backend closed connection (seq=%u, ack=%u)\n",
+                       conn.serverSeqNext, conn.clientSeq);
                 SendTCPPacket(conn.destIP, conn.destPort, conn.clientIP, conn.clientPort,
                               conn.serverSeqNext, conn.clientSeq, 0x11, nullptr, 0);
                 conn.serverSeqNext += 1;
