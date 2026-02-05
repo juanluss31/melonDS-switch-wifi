@@ -616,7 +616,7 @@ void Net_Switch::HandleIPFrame(u8* data, int len)
     u32 srcIP = ntohl(*(u32*)&data[12]);
     u32 dstIP = ntohl(*(u32*)&data[16]);
     
-    printf("Net_Switch: IP packet - protocol %d, %d.%d.%d.%d -> %d.%d.%d.%d.%d (len=%d)\n",
+    printf("Net_Switch: IP packet - protocol %d, %d.%d.%d.%d -> %d.%d.%d.%d (len=%d)\n",
            protocol,
            srcIP >> 24, (srcIP >> 16) & 0xFF, (srcIP >> 8) & 0xFF, srcIP & 0xFF,
            dstIP >> 24, (dstIP >> 16) & 0xFF, (dstIP >> 8) & 0xFF, dstIP & 0xFF,
@@ -802,12 +802,14 @@ int Net_Switch::SendPacket(u8* data, int len)
         {
         case 0x0806: // ARP
             printf("Net_Switch: ARP packet\n");
+            // Pass Ethernet frame with Ethernet header intact (ARP handler reads from offset 14)
             HandleARPFrame(data, len);
             break;
             
         case 0x0800: // IPv4
             printf("Net_Switch: IPv4 packet\n");
-            HandleIPFrame(data, len);
+            // Skip Ethernet header (14 bytes) and pass only IP portion
+            HandleIPFrame(data + 14, len - 14);
             break;
 
         default:
