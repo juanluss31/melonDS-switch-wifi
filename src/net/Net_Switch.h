@@ -59,6 +59,10 @@ private:
         u16 destPort;
         bool connected;
         u32 serverSeq;
+        u32 clientSeq;
+        u32 serverSeqNext;
+        u64 lastActivity;
+        bool connecting;
         std::vector<u8> recvBuffer;
     };
 

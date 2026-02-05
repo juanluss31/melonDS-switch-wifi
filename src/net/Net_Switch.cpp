@@ -508,6 +508,72 @@ void Net_Switch::ProcessUDPConnections()
 #endif
 }
 
+void Net_Switch::ProcessTCPConnections()
+{
+#ifdef __SWITCH__
+    for (auto it = TCPConnections.begin(); it != TCPConnections.end(); )
+    {
+        TCPConnection& conn = it->second;
+        bool eraseConn = false;
+
+        if (conn.socket >= 0)
+        {
+            if (conn.connecting)
+            {
+                int err = 0;
+                socklen_t errLen = sizeof(err);
+                if (getsockopt(conn.socket, SOL_SOCKET, SO_ERROR, &err, &errLen) == 0)
+                {
+                    if (err == 0)
+                    {
+                        conn.connecting = false;
+                        conn.connected = true;
+
+                        if (!conn.recvBuffer.empty())
+                        {
+                            send(conn.socket, conn.recvBuffer.data(), conn.recvBuffer.size(), 0);
+                            conn.recvBuffer.clear();
+                        }
+                    }
+                }
+            }
+
+            u8 buffer[2048];
+            ssize_t received = recv(conn.socket, buffer, sizeof(buffer), MSG_DONTWAIT);
+            if (received > 0)
+            {
+                SendTCPPacket(conn.destIP, conn.destPort, conn.clientIP, conn.clientPort,
+                              conn.serverSeqNext, conn.clientSeq, 0x18, buffer, (int)received);
+                conn.serverSeqNext += (u32)received;
+                conn.lastActivity = CurrentTime;
+            }
+            else if (received == 0)
+            {
+                SendTCPPacket(conn.destIP, conn.destPort, conn.clientIP, conn.clientPort,
+                              conn.serverSeqNext, conn.clientSeq, 0x11, nullptr, 0);
+                conn.serverSeqNext += 1;
+                eraseConn = true;
+            }
+            else if (errno != EWOULDBLOCK && errno != EAGAIN)
+            {
+                eraseConn = true;
+            }
+        }
+
+        if (eraseConn)
+        {
+            if (conn.socket >= 0)
+                close(conn.socket);
+            it = TCPConnections.erase(it);
+        }
+        else
+        {
+            ++it;
+        }
+    }
+#endif
+}
+
 void Net_Switch::CleanupOldConnections()
 {
 #ifdef __SWITCH__
@@ -524,6 +590,23 @@ void Net_Switch::CleanupOldConnections()
         else
         {
             ++it;
+        }
+    }
+
+    // Remove TCP connections that haven't been used recently
+    auto itTcp = TCPConnections.begin();
+    while (itTcp != TCPConnections.end())
+    {
+        if (CurrentTime - itTcp->second.lastActivity > TCP_TIMEOUT)
+        {
+            printf("Net_Switch: Closing idle TCP connection on port %d\n", itTcp->second.clientPort);
+            if (itTcp->second.socket >= 0)
+                close(itTcp->second.socket);
+            itTcp = TCPConnections.erase(itTcp);
+        }
+        else
+        {
+            ++itTcp;
         }
     }
 #endif
@@ -792,6 +875,7 @@ void Net_Switch::HandleTCPFrame(u8* ipHeader, int ipLen)
     u16 totalLen = ntohs(*(u16*)&ipHeader[2]);
     if (totalLen < ihl + tcpHeaderLen) return;
     int dataLen = (int)totalLen - ihl - tcpHeaderLen;
+    u8* payload = tcp + tcpHeaderLen;
     
     printf("Net_Switch: TCP %u.%u.%u.%u:%u -> %u.%u.%u.%u:%u (flags=0x%02x)\n",
            srcIP & 0xFF, (srcIP >> 8) & 0xFF, (srcIP >> 16) & 0xFF, (srcIP >> 24) & 0xFF, srcPort,
@@ -808,16 +892,48 @@ void Net_Switch::HandleTCPFrame(u8* ipHeader, int ipLen)
         u32 responseAck = seqNum + 1;
         SendTCPPacket(dstIP, dstPort, srcIP, srcPort, responseSeq, responseAck, 0x12, nullptr, 0);
         
-        // Track connection
-        TCPConnections[key] = {
-            .socket = -1,
-            .clientIP = srcIP,
-            .clientPort = srcPort,
-            .destIP = dstIP,
-            .destPort = dstPort,
-            .connected = false,
-            .serverSeq = responseSeq
-        };
+        // Create nonblocking socket to real destination
+        int sock = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+        if (sock >= 0)
+        {
+            int flagsOpt = fcntl(sock, F_GETFL, 0);
+            fcntl(sock, F_SETFL, flagsOpt | O_NONBLOCK);
+
+            struct sockaddr_in addr;
+            memset(&addr, 0, sizeof(addr));
+            addr.sin_family = AF_INET;
+            addr.sin_port = htons(dstPort);
+            addr.sin_addr.s_addr = htonl(dstIP);
+
+            int rc = connect(sock, (struct sockaddr*)&addr, sizeof(addr));
+            bool connecting = false;
+            if (rc < 0)
+            {
+                if (errno == EINPROGRESS)
+                    connecting = true;
+                else
+                {
+                    close(sock);
+                    sock = -1;
+                }
+            }
+
+            // Track connection
+            TCPConnection conn;
+            conn.socket = sock;
+            conn.clientIP = srcIP;
+            conn.clientPort = srcPort;
+            conn.destIP = dstIP;
+            conn.destPort = dstPort;
+            conn.connected = (rc == 0);
+            conn.serverSeq = responseSeq;
+            conn.clientSeq = responseAck;
+            conn.serverSeqNext = responseSeq + 1;
+            conn.lastActivity = CurrentTime;
+            conn.connecting = connecting;
+            conn.recvBuffer.clear();
+            TCPConnections[key] = conn;
+        }
     }
     // For all other packets on established connections, just send ACK
     else
@@ -825,9 +941,34 @@ void Net_Switch::HandleTCPFrame(u8* ipHeader, int ipLen)
         auto it = TCPConnections.find(key);
         if (it != TCPConnections.end())
         {
+            TCPConnection& conn = it->second;
+            conn.lastActivity = CurrentTime;
+
+            if (dataLen > 0)
+            {
+                if (conn.socket >= 0)
+                {
+                    if (conn.connected)
+                    {
+                        send(conn.socket, payload, dataLen, 0);
+                    }
+                    else
+                    {
+                        conn.recvBuffer.insert(conn.recvBuffer.end(), payload, payload + dataLen);
+                    }
+                }
+                conn.clientSeq = seqNum + dataLen;
+            }
+            else if (isFIN)
+            {
+                conn.clientSeq = seqNum + 1;
+                if (conn.socket >= 0)
+                    shutdown(conn.socket, SHUT_WR);
+            }
+
             // Send ACK for this packet - acknowledge the sequence number + data length
-            u32 responseSeq = it->second.serverSeq + 1;
-            u32 responseAck = seqNum + (dataLen > 0 ? dataLen : (isFIN ? 1 : 0));
+            u32 responseSeq = conn.serverSeqNext;
+            u32 responseAck = conn.clientSeq;
             printf("Net_Switch: Sending TCP ACK\n");
             SendTCPPacket(dstIP, dstPort, srcIP, srcPort, responseSeq, responseAck, 0x10, nullptr, 0);
             
@@ -835,7 +976,9 @@ void Net_Switch::HandleTCPFrame(u8* ipHeader, int ipLen)
             if (isFIN)
             {
                 printf("Net_Switch: Sending FIN-ACK in response\n");
-                SendTCPPacket(dstIP, dstPort, srcIP, srcPort, responseSeq, responseAck + 1, 0x11, nullptr, 0);
+                SendTCPPacket(dstIP, dstPort, srcIP, srcPort, responseSeq, responseAck, 0x11, nullptr, 0);
+                if (conn.socket >= 0)
+                    close(conn.socket);
                 TCPConnections.erase(it);
             }
         }
@@ -1003,6 +1146,9 @@ void Net_Switch::RecvCheck()
 
     // Process UDP connections (check for incoming data)
     ProcessUDPConnections();
+
+    // Process TCP connections (check for incoming data)
+    ProcessTCPConnections();
 
     // Cleanup old connections periodically
     static u64 lastCleanup = 0;
