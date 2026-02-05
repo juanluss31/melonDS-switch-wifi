@@ -24,13 +24,19 @@
 #include "../FIFO.h"
 #include "NetDriver.h"
 #include <functional>
+#include <map>
+#include <vector>
 
 #ifdef __SWITCH__
 #include <switch.h>
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
+#include <poll.h>
 #endif
 
-// Simple network driver for Nintendo Switch using built-in network stack
-// This provides basic networking capabilities using the Switch's native network interface
+// Network driver for Nintendo Switch with full TCP/UDP/DHCP/DNS support
+// Provides NAT-like functionality similar to libslirp
 class Net_Switch : public NetDriver
 {
 public:
@@ -43,20 +49,70 @@ public:
     void RecvCheck() override;
 
 private:
+    // Connection tracking structures
+    struct TCPConnection
+    {
+        int socket;
+        u32 clientIP;
+        u16 clientPort;
+        u32 destIP;
+        u16 destPort;
+        bool connected;
+        std::vector<u8> recvBuffer;
+    };
+
+    struct UDPConnection
+    {
+        int socket;
+        u32 clientIP;
+        u16 clientPort;
+        u32 destIP;
+        u16 destPort;
+        u64 lastActivity;
+    };
+
     SendPacketCallback Callback;
     FIFO<u32, (0x8000 >> 2)> RXBuffer;
     u32 IPv4ID;
     bool Initialized;
+    u64 CurrentTime;
+
+    // Connection tracking
+    std::map<u32, TCPConnection> TCPConnections; // Key: clientPort | (clientIP << 16)
+    std::map<u32, UDPConnection> UDPConnections; // Key: clientPort | (clientIP << 16)
 
 #ifdef __SWITCH__
     SocketInitConfig socketConfig;
 #endif
 
+    // Protocol handlers
     void HandleARPFrame(u8* data, int len);
     void HandleIPFrame(u8* data, int len);
-    void HandleDNSFrame(u8* data, int len);
-    void HandleDHCPFrame(u8* data, int len);
+    void HandleICMPFrame(u8* ipHeader, int ipLen);
+    void HandleTCPFrame(u8* ipHeader, int ipLen);
+    void HandleUDPFrame(u8* ipHeader, int ipLen);
+    void HandleDHCPFrame(u8* udpData, int udpLen, u32 srcIP);
+    void HandleDNSFrame(u8* udpData, int udpLen, u32 srcIP, u16 srcPort);
+    void ForwardUDPPacket(u32 srcIP, u16 srcPort, u32 dstIP, u16 dstPort, u8* data, int len);
+
+    // TCP/UDP connection management
+    void ProcessTCPConnections();
+    void ProcessUDPConnections();
+    void CleanupOldConnections();
+
+    // Packet construction helpers
+    void SendIPPacket(u8* ethDest, u8 protocol, u32 srcIP, u32 dstIP, u8* payload, int payloadLen);
+    void SendUDPPacket(u32 srcIP, u16 srcPort, u32 dstIP, u16 dstPort, u8* data, int len);
+    void SendTCPPacket(u32 srcIP, u16 srcPort, u32 dstIP, u16 dstPort, 
+                       u32 seq, u32 ack, u8 flags, u8* data, int len);
+    void SendICMPPacket(u32 srcIP, u32 dstIP, u8 type, u8 code, u8* data, int len);
+
+    // Utility functions
     u16 IPChecksum(u8* data, int len);
+    u16 TCPChecksum(u32 srcIP, u32 dstIP, u8* tcpData, int tcpLen);
+    u16 UDPChecksum(u32 srcIP, u32 dstIP, u8* udpData, int udpLen);
+    u32 MakeConnectionKey(u32 ip, u16 port);
+    u64 GetMonotonicTime();
 };
 
 #endif // NET_SWITCH_H

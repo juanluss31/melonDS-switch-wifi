@@ -18,6 +18,8 @@
 
 #include <stdio.h>
 #include <string.h>
+#include <time.h>
+#include <errno.h>
 #include "Net_Switch.h"
 
 #ifdef __SWITCH__
@@ -25,6 +27,8 @@
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
+#include <fcntl.h>
+#include <unistd.h>
 #endif
 
 // Subnet configuration - same as libslirp uses
@@ -34,16 +38,23 @@ const u32 kDNSIP    = kSubnet | 0x02;
 const u32 kClientIP = kSubnet | 0x10;
 
 const u8 kServerMAC[6] = {0x00, 0xAB, 0x33, 0x28, 0x99, 0x44};
+const u8 kClientMAC[6] = {0x00, 0x16, 0x56, 0x83, 0x31, 0xF9}; // Client MAC address
+
+// Connection timeout in microseconds
+const u64 UDP_TIMEOUT = 30000000; // 30 seconds
+const u64 TCP_TIMEOUT = 300000000; // 5 minutes
 
 Net_Switch::Net_Switch(const SendPacketCallback& callback)
     : Callback(callback)
     , IPv4ID(0)
     , Initialized(false)
+    , CurrentTime(0)
 {
 #ifdef __SWITCH__
     // Initialize BSD sockets on Switch
     socketInitializeDefault();
     Initialized = true;
+    printf("Net_Switch: Network driver initialized\n");
 #endif
 }
 
@@ -52,10 +63,97 @@ Net_Switch::~Net_Switch()
 #ifdef __SWITCH__
     if (Initialized)
     {
+        // Close all TCP connections
+        for (auto& pair : TCPConnections)
+        {
+            if (pair.second.socket >= 0)
+                close(pair.second.socket);
+        }
+        TCPConnections.clear();
+
+        // Close all UDP sockets
+        for (auto& pair : UDPConnections)
+        {
+            if (pair.second.socket >= 0)
+                close(pair.second.socket);
+        }
+        UDPConnections.clear();
+
         socketExit();
         Initialized = false;
+        printf("Net_Switch: Network driver shut down\n");
     }
 #endif
+}
+
+u64 Net_Switch::GetMonotonicTime()
+{
+#ifdef __SWITCH__
+    return armGetSystemTick() * 1000000ULL / 19200000ULL; // Convert ticks to microseconds
+#else
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (u64)ts.tv_sec * 1000000 + ts.tv_nsec / 1000;
+#endif
+}
+
+u32 Net_Switch::MakeConnectionKey(u32 ip, u16 port)
+{
+    return (u32)port | ((ip & 0xFFFF) << 16);
+}
+
+u16 Net_Switch::TCPChecksum(u32 srcIP, u32 dstIP, u8* tcpData, int tcpLen)
+{
+    // Create pseudo-header
+    u8 pseudo[12];
+    *(u32*)&pseudo[0] = htonl(srcIP);
+    *(u32*)&pseudo[4] = htonl(dstIP);
+    pseudo[8] = 0;
+    pseudo[9] = 6; // TCP
+    *(u16*)&pseudo[10] = htons(tcpLen);
+
+    u32 sum = 0;
+    for (int i = 0; i < 12; i += 2)
+        sum += (pseudo[i] << 8) | pseudo[i+1];
+    
+    for (int i = 0; i < tcpLen; i += 2)
+    {
+        if (i + 1 < tcpLen)
+            sum += (tcpData[i] << 8) | tcpData[i+1];
+        else
+            sum += tcpData[i] << 8;
+    }
+    
+    while (sum >> 16)
+        sum = (sum & 0xFFFF) + (sum >> 16);
+    return ~sum;
+}
+
+u16 Net_Switch::UDPChecksum(u32 srcIP, u32 dstIP, u8* udpData, int udpLen)
+{
+    // Create pseudo-header
+    u8 pseudo[12];
+    *(u32*)&pseudo[0] = htonl(srcIP);
+    *(u32*)&pseudo[4] = htonl(dstIP);
+    pseudo[8] = 0;
+    pseudo[9] = 17; // UDP
+    *(u16*)&pseudo[10] = htons(udpLen);
+
+    u32 sum = 0;
+    for (int i = 0; i < 12; i += 2)
+        sum += (pseudo[i] << 8) | pseudo[i+1];
+    
+    for (int i = 0; i < udpLen; i += 2)
+    {
+        if (i + 1 < udpLen)
+            sum += (udpData[i] << 8) | udpData[i+1];
+        else
+            sum += udpData[i] << 8;
+    }
+    
+    while (sum >> 16)
+        sum = (sum & 0xFFFF) + (sum >> 16);
+    return ~sum;
 }
 
 void Net_Switch::HandleARPFrame(u8* data, int len)
@@ -94,14 +192,169 @@ void Net_Switch::HandleARPFrame(u8* data, int len)
         Callback(reply, 42);
 }
 
-void Net_Switch::HandleDNSFrame(u8* data, int len)
+void Net_Switch::HandleDNSFrame(u8* data, int len, u32 srcIP, u16 srcPort)
 {
-    // Simple DNS handling - minimal implementation
-    // Most DNS queries will just be dropped, real DNS would be handled by Switch OS
-    // This is mainly to prevent crashes and provide basic functionality
+    // Forward DNS query to real DNS server (e.g., 8.8.8.8)
+    u32 realDNS = 0x08080808; // 8.8.8.8
+    
+    printf("Net_Switch: Forwarding DNS query to 8.8.8.8\n");
+    ForwardUDPPacket(srcIP, srcPort, realDNS, 53, data, len);
 }
 
-void Net_Switch::HandleDHCPFrame(u8* data, int len)
+void Net_Switch::SendUDPPacket(u32 srcIP, u16 srcPort, u32 dstIP, u16 dstPort, u8* data, int len)
+{
+    u8 packet[2048];
+    u8* p = packet;
+
+    // Ethernet header
+    memcpy(p, kClientMAC, 6); p += 6; // Dest MAC
+    memcpy(p, kServerMAC, 6); p += 6; // Src MAC
+    *p++ = 0x08; *p++ = 0x00; // IPv4
+
+    // IP header
+    u8* ipHeader = p;
+    *p++ = 0x45; // Version 4, IHL 5
+    *p++ = 0x00; // DSCP/ECN
+    u16 totalLen = 20 + 8 + len;
+    *p++ = (totalLen >> 8); *p++ = (totalLen & 0xFF);
+    *p++ = (IPv4ID >> 8); *p++ = (IPv4ID & 0xFF); IPv4ID++;
+    *p++ = 0x00; *p++ = 0x00; // Flags/Fragment
+    *p++ = 0x40; // TTL
+    *p++ = 17; // Protocol (UDP)
+    *p++ = 0x00; *p++ = 0x00; // Checksum (fill later)
+    *(u32*)p = htonl(srcIP); p += 4; // Source IP
+    *(u32*)p = htonl(dstIP); p += 4; // Dest IP
+
+    // UDP header  
+    u8* udpHeader = p;
+    *p++ = (srcPort >> 8); *p++ = (srcPort & 0xFF);
+    *p++ = (dstPort >> 8); *p++ = (dstPort & 0xFF);
+    u16 udpLen = 8 + len;
+    *p++ = (udpLen >> 8); *p++ = (udpLen & 0xFF);
+    *p++ = 0x00; *p++ = 0x00; // Checksum (fill later)
+    
+    // Data
+    memcpy(p, data, len);
+    p += len;
+
+    // Calculate IP checksum
+    ipHeader[10] = 0; ipHeader[11] = 0;
+    u16 ipChecksum = IPChecksum(ipHeader, 20);
+    ipHeader[10] = (ipChecksum >> 8);
+    ipHeader[11] = (ipChecksum & 0xFF);
+
+    // Calculate UDP checksum
+    u16 udpChecksum = UDPChecksum(srcIP, dstIP, udpHeader, udpLen);
+    udpHeader[6] = (udpChecksum >> 8);
+    udpHeader[7] = (udpChecksum & 0xFF);
+
+    if (Callback)
+        Callback(packet, p - packet);
+}
+
+void Net_Switch::SendICMPPacket(u32 srcIP, u32 dstIP, u8 type, u8 code, u8* data, int len)
+{
+    u8 packet[2048];
+    u8* p = packet;
+
+    // Ethernet header
+    memcpy(p, kClientMAC, 6); p += 6;
+    memcpy(p, kServerMAC, 6); p += 6;
+    *p++ = 0x08; *p++ = 0x00; // IPv4
+
+    // IP header
+    u8* ipHeader = p;
+    *p++ = 0x45;
+    *p++ = 0x00;
+    u16 totalLen = 20 + 8 + len;
+    *p++ = (totalLen >> 8); *p++ = (totalLen & 0xFF);
+    *p++ = (IPv4ID >> 8); *p++ = (IPv4ID & 0xFF); IPv4ID++;
+    *p++ = 0x00; *p++ = 0x00;
+    *p++ = 0x40; // TTL
+    *p++ = 1; // Protocol (ICMP)
+    *p++ = 0x00; *p++ = 0x00; // Checksum
+    *(u32*)p = htonl(srcIP); p += 4;
+    *(u32*)p = htonl(dstIP); p += 4;
+
+    // ICMP header
+    u8* icmpHeader = p;
+    *p++ = type;
+    *p++ = code;
+    *p++ = 0x00; *p++ = 0x00; // Checksum
+    *p++ = 0x00; *p++ = 0x00; // ID
+    *p++ = 0x00; *p++ = 0x00; // Sequence
+    
+    // Data
+    memcpy(p, data, len);
+    p += len;
+
+    // Calculate checksums
+    ipHeader[10] = 0; ipHeader[11] = 0;
+    u16 ipChecksum = IPChecksum(ipHeader, 20);
+    ipHeader[10] = (ipChecksum >> 8);
+    ipHeader[11] = (ipChecksum & 0xFF);
+
+    int icmpLen = 8 + len;
+    u16 icmpChecksum = IPChecksum(icmpHeader, icmpLen);
+    icmpHeader[2] = (icmpChecksum >> 8);
+    icmpHeader[3] = (icmpChecksum & 0xFF);
+
+    if (Callback)
+        Callback(packet, p - packet);
+}
+
+void Net_Switch::ProcessUDPConnections()
+{
+#ifdef __SWITCH__
+    // Poll all UDP connections for incoming data
+    for (auto& pair : UDPConnections)
+    {
+        UDPConnection& conn = pair.second;
+        
+        u8 buffer[2048];
+        struct sockaddr_in from;
+        socklen_t fromLen = sizeof(from);
+        
+        ssize_t received = recvfrom(conn.socket, buffer, sizeof(buffer), MSG_DONTWAIT,
+                                     (struct sockaddr*)&from, &fromLen);
+        
+        if (received > 0)
+        {
+            // Got data - send back to DS
+            u32 realSrcIP = ntohl(from.sin_addr.s_addr);
+            u16 realSrcPort = ntohs(from.sin_port);
+            
+            SendUDPPacket(realSrcIP, realSrcPort, conn.clientIP, conn.clientPort,
+                          buffer, received);
+            
+            conn.lastActivity = CurrentTime;
+        }
+    }
+#endif
+}
+
+void Net_Switch::CleanupOldConnections()
+{
+#ifdef __SWITCH__
+    // Remove UDP connections that haven't been used recently
+    auto it = UDPConnections.begin();
+    while (it != UDPConnections.end())
+    {
+        if (CurrentTime - it->second.lastActivity > UDP_TIMEOUT)
+        {
+            printf("Net_Switch: Closing idle UDP connection on port %d\n", it->second.clientPort);
+            close(it->second.socket);
+            it = UDPConnections.erase(it);
+        }
+        else
+        {
+            ++it;
+        }
+    }
+#endif
+}
+
+void Net_Switch::HandleDHCPFrame(u8* data, int len, u32 srcIP)
 {
     // DHCP packet structure:
     // UDP header at data[0..7]
@@ -284,28 +537,159 @@ void Net_Switch::HandleIPFrame(u8* data, int len)
     if (len < ihl) return;
 
     u8 protocol = data[9];
+    u32 srcIP = ntohl(*(u32*)&data[12]);
+    u32 dstIP = ntohl(*(u32*)&data[16]);
     
-    // Handle UDP packets (for DHCP)
+    // Handle UDP packets
     if (protocol == 0x11) // UDP
     {
-        if (len < ihl + 8) return; // IP header + UDP header
-        
-        u16 srcPort = (data[ihl] << 8) | data[ihl+1];
-        u16 dstPort = (data[ihl+2] << 8) | data[ihl+3];
-        
-        printf("Net_Switch: UDP packet: src=%d dst=%d len=%d\n", srcPort, dstPort, len);
-        
-        // DHCP client->server (port 67)
-        if (dstPort == 67 && srcPort == 68)
-        {
-            HandleDHCPFrame(&data[ihl], len - ihl);
-            return;
-        }
+        HandleUDPFrame(data, len);
+        return;
     }
     
-    // For now, we mainly handle the frame reception
-    // Actual protocol handling would need more complex implementation
-    // The Switch's network stack will handle most of this
+    // Handle ICMP packets (ping)
+    if (protocol == 0x01) // ICMP
+    {
+        HandleICMPFrame(data, len);
+        return;
+    }
+    
+    // Handle TCP packets
+    if (protocol == 0x06) // TCP
+    {
+        HandleTCPFrame(data, len);
+        return;
+    }
+}
+
+void Net_Switch::HandleICMPFrame(u8* ipHeader, int ipLen)
+{
+    u8 ihl = (ipHeader[0] & 0x0F) * 4;
+    if (ipLen < ihl + 8) return;
+
+    u8* icmp = ipHeader + ihl;
+    u8 type = icmp[0];
+    u8 code = icmp[1];
+
+    u32 srcIP = ntohl(*(u32*)&ipHeader[12]);
+    u32 dstIP = ntohl(*(u32*)&ipHeader[16]);
+
+    // Handle Echo Request (ping)
+    if (type == 8 && code == 0)
+    {
+        int icmpLen = ipLen - ihl;
+        printf("Net_Switch: ICMP Echo Request\n");
+
+        // Send Echo Reply back
+        SendICMPPacket(dstIP, srcIP, 0, 0, icmp + 8, icmpLen - 8);
+    }
+}
+
+void Net_Switch::HandleTCPFrame(u8* ipHeader, int ipLen)
+{
+    u8 ihl = (ipHeader[0] & 0x0F) * 4;
+    if (ipLen < ihl + 20) return;
+
+    // TCP forwarding - to be implemented
+    printf("Net_Switch: TCP packet received (not yet implemented)\n");
+}
+
+void Net_Switch::HandleUDPFrame(u8* ipHeader, int ipLen)
+{
+    u8 ihl = (ipHeader[0] & 0x0F) * 4;
+    if (ipLen < ihl + 8) return;
+
+    u8* udp = ipHeader + ihl;
+    u16 srcPort = ntohs(*(u16*)&udp[0]);
+    u16 dstPort = ntohs(*(u16*)&udp[2]);
+    u16 udpLen = ntohs(*(u16*)&udp[4]);
+    
+    u32 srcIP = ntohl(*(u32*)&ipHeader[12]);
+    u32 dstIP = ntohl(*(u32*)&ipHeader[16]);
+    
+    int dataLen = udpLen - 8;
+    if (dataLen < 0 || ihl + udpLen > ipLen) return;
+
+    // Handle DHCP (port 67)
+    if (dstPort == 67 && srcPort == 68)
+    {
+        HandleDHCPFrame(udp, udpLen, srcIP);
+        return;
+    }
+
+    // Handle DNS (port 53) - forward to real DNS server
+    if (dstPort == 53)
+    {
+        HandleDNSFrame(udp + 8, dataLen, srcIP, srcPort);
+        return;
+    }
+
+    // Generic UDP forwarding to internet
+    ForwardUDPPacket(srcIP, srcPort, dstIP, dstPort, udp + 8, dataLen);
+}
+
+void Net_Switch::ForwardUDPPacket(u32 srcIP, u16 srcPort, u32 dstIP, u16 dstPort, u8* data, int len)
+{
+#ifndef __SWITCH__
+    return; // Only works on Switch
+#else
+    // Find existing connection or create new one
+    u32 key = MakeConnectionKey(srcIP, srcPort);
+    auto it = UDPConnections.find(key);
+    
+    if (it == UDPConnections.end())
+    {
+        // Create new UDP socket
+        int sock = socket(AF_INET, SOCK_DGRAM, 0);
+        if (sock < 0)
+        {
+            printf("Net_Switch: Failed to create UDP socket: %d\n", errno);
+            return;
+        }
+        
+        // Set non-blocking
+        fcntl(sock, F_SETFL, O_NONBLOCK);
+        
+        // Create connection entry
+        UDPConnection conn;
+        conn.socket = sock;
+        conn.clientIP = srcIP;
+        conn.clientPort = srcPort;
+        conn.destIP = dstIP;
+        conn.destPort = dstPort;
+        conn.lastActivity = GetMonotonicTime();
+        
+        UDPConnections[key] = conn;
+        
+        printf("Net_Switch: New UDP connection: %d -> %d.%d.%d.%d:%d\n",
+               srcPort, (dstIP>>24)&0xFF, (dstIP>>16)&0xFF, (dstIP>>8)&0xFF, dstIP&0xFF, dstPort);
+    }
+    else
+    {
+        // Update destination if changed
+        it->second.destIP = dstIP;
+        it->second.destPort = dstPort;
+    }
+    
+    // Send data to real destination
+    struct sockaddr_in addr;
+    memset(&addr, 0, sizeof(addr));
+    addr.sin_family = AF_INET;
+    addr.sin_addr.s_addr = htonl(dstIP);
+    addr.sin_port = htons(dstPort);
+    
+    ssize_t sent = sendto(UDPConnections[key].socket, data, len, 0, 
+                          (struct sockaddr*)&addr, sizeof(addr));
+    
+    if (sent < 0)
+    {
+        printf("Net_Switch: UDP send failed: %d\n", errno);
+    }
+    else
+    {
+        UDPConnections[key].lastActivity = GetMonotonicTime();
+    }
+#endif
 }
 
 int Net_Switch::SendPacket(u8* data, int len)
@@ -347,6 +731,20 @@ void Net_Switch::RecvCheck()
     if (!Initialized)
         return;
 
+    // Update current time
+    CurrentTime = GetMonotonicTime();
+
+    // Process UDP connections (check for incoming data)
+    ProcessUDPConnections();
+
+    // Cleanup old connections periodically
+    static u64 lastCleanup = 0;
+    if (CurrentTime - lastCleanup > 5000000) // Every 5 seconds
+    {
+        CleanupOldConnections();
+        lastCleanup = CurrentTime;
+    }
+
 #ifdef __SWITCH__
     // Check for incoming packets from the Switch's network stack
     // This would poll the network interface for incoming data
@@ -363,3 +761,4 @@ void Net_Switch::RecvCheck()
         // and calling the callback with the received data
     }
 }
+
