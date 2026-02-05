@@ -519,17 +519,13 @@ void Net_Switch::ProcessTCPConnections()
     if (TCPConnections.empty())
         return;
 
-    // Log occasionally for debugging (every ~60 frames = 1 second)
-    static int logCounter = 0;
+    // Count connecting sockets for debug purposes (but don't spam logs)
     int connectingCount = 0;
     for (auto& pair : TCPConnections)
     {
         if (pair.second.connecting)
             connectingCount++;
     }
-    if (connectingCount > 0 && (++logCounter % 60 == 0))
-        printf("Net_Switch: ProcessTCPConnections - %d total, %d connecting (waiting...)\n", 
-               (int)TCPConnections.size(), connectingCount);
 
     // Build pollfd array for all TCP sockets
     std::vector<struct pollfd> pollfds;
@@ -541,7 +537,9 @@ void Net_Switch::ProcessTCPConnections()
         {
             struct pollfd pfd;
             pfd.fd = pair.second.socket;
-            pfd.events = pair.second.connecting ? POLLOUT : POLLIN;
+            // For connecting sockets, watch for POLLOUT (ready), POLLERR (failed), POLLHUP (closed)
+            // For connected sockets, just watch for POLLIN (data available)
+            pfd.events = pair.second.connecting ? (POLLOUT | POLLERR | POLLHUP) : POLLIN;
             pfd.revents = 0;
             pollfds.push_back(pfd);
             portMap.push_back(pair.first);
@@ -552,10 +550,10 @@ void Net_Switch::ProcessTCPConnections()
         return;
     
     // Poll all sockets at once (timeout 0 = non-blocking check)
-    int ready = poll(pollfds.data(), pollfds.size(), 0);
+    // Use 10ms timeout to give connecting sockets time to progress
+    int ready = poll(pollfds.data(), pollfds.size(), 10);
     
-    // Note: We don't return early even if ready <= 0, because we need to check
-    // connecting sockets that might not show activity yet but need status checks
+    // Process results without spamming logs
     
     // Process all sockets (check connecting ones even without poll activity)
     for (auto it = TCPConnections.begin(); it != TCPConnections.end(); )
@@ -595,12 +593,20 @@ void Net_Switch::ProcessTCPConnections()
                     close(conn.socket);
                     eraseConn = true;
                 }
+                // Check for connection errors first
+                else if (pollIndex >= 0 && (pollfds[pollIndex].revents & (POLLERR | POLLHUP)))
+                {
+                    printf("Net_Switch: TCP connection failed (POLLERR/POLLHUP detected)\n");
+                    SendTCPPacket(conn.destIP, conn.destPort, conn.clientIP, conn.clientPort,
+                                  conn.serverSeqNext, conn.clientSeq, 0x14, nullptr, 0); // RST+ACK
+                    close(conn.socket);
+                    eraseConn = true;
+                }
                 // Check if socket is ready for writing (connection established)
                 else if (pollIndex >= 0 && (pollfds[pollIndex].revents & POLLOUT))
                 {
                     int err = 0;
                     socklen_t errLen = sizeof(err);
-                    printf("Net_Switch: POLLOUT detected, checking SO_ERROR\n");
                     if (getsockopt(conn.socket, SOL_SOCKET, SO_ERROR, &err, &errLen) == 0 && err == 0)
                     {
                         conn.connecting = false;
@@ -609,12 +615,21 @@ void Net_Switch::ProcessTCPConnections()
 
                         if (!conn.recvBuffer.empty())
                         {
-                            ssize_t sent = send(conn.socket, conn.recvBuffer.data(), conn.recvBuffer.size(), 0);
-                            if (sent < 0 && errno != EWOULDBLOCK && errno != EAGAIN)
-                                printf("Net_Switch: TCP buffered send failed (errno=%d)\n", errno);
-                            else if (sent >= 0)
+                            ssize_t sent = send(conn.socket, conn.recvBuffer.data(), conn.recvBuffer.size(), MSG_DONTWAIT);
+                            if (sent > 0)
+                            {
                                 printf("Net_Switch: TCP sent %zd buffered bytes\n", sent);
-                            conn.recvBuffer.clear();
+                                // Only remove the bytes that were actually sent
+                                conn.recvBuffer.erase(conn.recvBuffer.begin(), conn.recvBuffer.begin() + sent);
+                            }
+                            else if (sent < 0 && errno != EWOULDBLOCK && errno != EAGAIN)
+                            {
+                                printf("Net_Switch: TCP buffered send failed (errno=%d)\n", errno);
+                                SendTCPPacket(conn.destIP, conn.destPort, conn.clientIP, conn.clientPort,
+                                              conn.serverSeqNext, conn.clientSeq, 0x14, nullptr, 0); // RST+ACK
+                                eraseConn = true;
+                            }
+                            // If EWOULDBLOCK/EAGAIN, keep trying next frame
                         }
                     }
                     else if (err != 0)
