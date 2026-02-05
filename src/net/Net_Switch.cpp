@@ -561,8 +561,9 @@ void Net_Switch::ProcessTCPConnections()
             }
         }
         
-        // Skip if socket wasn't polled or has no activity
-        if (pollIndex < 0 || pollfds[pollIndex].revents == 0)
+        // For connecting sockets, always check even without revents
+        // For connected sockets, skip if no activity
+        if (pollIndex >= 0 && !conn.connecting && pollfds[pollIndex].revents == 0)
         {
             ++it;
             continue;
@@ -573,7 +574,7 @@ void Net_Switch::ProcessTCPConnections()
             if (conn.connecting)
             {
                 // Check if socket is ready for writing (connection established)
-                if (pollfds[pollIndex].revents & POLLOUT)
+                if (pollIndex >= 0 && (pollfds[pollIndex].revents & POLLOUT))
                 {
                     int err = 0;
                     socklen_t errLen = sizeof(err);
@@ -984,13 +985,22 @@ void Net_Switch::HandleTCPFrame(u8* ipHeader, int ipLen)
             if (rc < 0)
             {
                 if (errno == EINPROGRESS)
+                {
                     connecting = true;
+                    printf("Net_Switch: TCP connect to %u.%u.%u.%u:%u in progress (EINPROGRESS)\n",
+                           dstIP & 0xFF, (dstIP >> 8) & 0xFF, (dstIP >> 16) & 0xFF, (dstIP >> 24) & 0xFF, dstPort);
+                }
                 else
                 {
                     printf("Net_Switch: TCP connect failed (errno=%d)\n", errno);
                     close(sock);
                     sock = -1;
                 }
+            }
+            else
+            {
+                printf("Net_Switch: TCP connect to %u.%u.%u.%u:%u succeeded immediately\n",
+                       dstIP & 0xFF, (dstIP >> 8) & 0xFF, (dstIP >> 16) & 0xFF, (dstIP >> 24) & 0xFF, dstPort);
             }
 
             // Track connection
