@@ -58,6 +58,7 @@ private:
         u32 destIP;
         u16 destPort;
         bool connected;
+        u32 serverSeq;
         std::vector<u8> recvBuffer;
     };
 

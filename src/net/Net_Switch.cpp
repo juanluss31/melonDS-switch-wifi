@@ -788,8 +788,10 @@ void Net_Switch::HandleTCPFrame(u8* ipHeader, int ipLen)
     bool isSYN = (flags & 0x02) != 0;
     bool isACK = (flags & 0x10) != 0;
     bool isFIN = (flags & 0x01) != 0;
-    
-    int dataLen = ipLen - ihl - tcpHeaderLen;
+
+    u16 totalLen = ntohs(*(u16*)&ipHeader[2]);
+    if (totalLen < ihl + tcpHeaderLen) return;
+    int dataLen = (int)totalLen - ihl - tcpHeaderLen;
     
     printf("Net_Switch: TCP %u.%u.%u.%u:%u -> %u.%u.%u.%u:%u (flags=0x%02x)\n",
            srcIP & 0xFF, (srcIP >> 8) & 0xFF, (srcIP >> 16) & 0xFF, (srcIP >> 24) & 0xFF, srcPort,
@@ -813,7 +815,8 @@ void Net_Switch::HandleTCPFrame(u8* ipHeader, int ipLen)
             .clientPort = srcPort,
             .destIP = dstIP,
             .destPort = dstPort,
-            .connected = false
+            .connected = false,
+            .serverSeq = responseSeq
         };
     }
     // For all other packets on established connections, just send ACK
@@ -823,7 +826,7 @@ void Net_Switch::HandleTCPFrame(u8* ipHeader, int ipLen)
         if (it != TCPConnections.end())
         {
             // Send ACK for this packet - acknowledge the sequence number + data length
-            u32 responseSeq = 0x10000001;
+            u32 responseSeq = it->second.serverSeq + 1;
             u32 responseAck = seqNum + (dataLen > 0 ? dataLen : (isFIN ? 1 : 0));
             printf("Net_Switch: Sending TCP ACK\n");
             SendTCPPacket(dstIP, dstPort, srcIP, srcPort, responseSeq, responseAck, 0x10, nullptr, 0);
@@ -832,7 +835,6 @@ void Net_Switch::HandleTCPFrame(u8* ipHeader, int ipLen)
             if (isFIN)
             {
                 printf("Net_Switch: Sending FIN-ACK in response\n");
-                responseSeq = 0x10000002;
                 SendTCPPacket(dstIP, dstPort, srcIP, srcPort, responseSeq, responseAck + 1, 0x11, nullptr, 0);
                 TCPConnections.erase(it);
             }
