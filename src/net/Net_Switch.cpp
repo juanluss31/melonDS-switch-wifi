@@ -355,6 +355,66 @@ void Net_Switch::SendUDPPacket(u32 srcIP, u16 srcPort, u32 dstIP, u16 dstPort, u
         Callback(packet, p - packet);
 }
 
+void Net_Switch::SendTCPPacket(u32 srcIP, u16 srcPort, u32 dstIP, u16 dstPort, 
+                               u32 seq, u32 ack, u8 flags, u8* data, int len)
+{
+    u8 packet[2048];
+    u8* p = packet;
+
+    // Ethernet header
+    memcpy(p, kClientMAC, 6); p += 6; // Dest MAC
+    memcpy(p, kServerMAC, 6); p += 6; // Src MAC
+    *p++ = 0x08; *p++ = 0x00; // IPv4
+
+    // IP header
+    u8* ipHeader = p;
+    *p++ = 0x45; // Version 4, IHL 5
+    *p++ = 0x00; // DSCP/ECN
+    u16 tcpLen = 20; // TCP header without options
+    u16 totalLen = 20 + tcpLen + len;
+    *p++ = (totalLen >> 8); *p++ = (totalLen & 0xFF);
+    *p++ = (IPv4ID >> 8); *p++ = (IPv4ID & 0xFF); IPv4ID++;
+    *p++ = 0x00; *p++ = 0x00; // Flags/Fragment
+    *p++ = 0x40; // TTL
+    *p++ = 6; // Protocol (TCP)
+    *p++ = 0x00; *p++ = 0x00; // Checksum (fill later)
+    *(u32*)p = htonl(srcIP); p += 4; // Source IP
+    *(u32*)p = htonl(dstIP); p += 4; // Dest IP
+
+    // TCP header
+    u8* tcpHeader = p;
+    *p++ = (srcPort >> 8); *p++ = (srcPort & 0xFF);
+    *p++ = (dstPort >> 8); *p++ = (dstPort & 0xFF);
+    *(u32*)p = htonl(seq); p += 4;
+    *(u32*)p = htonl(ack); p += 4;
+    *p++ = 0x50; // Data offset 5 (20 bytes), no reserved bits
+    *p++ = flags;
+    *p++ = 0x20; *p++ = 0x00; // Window size (8192)
+    *p++ = 0x00; *p++ = 0x00; // Checksum (fill later)
+    *p++ = 0x00; *p++ = 0x00; // Urgent pointer
+
+    // Data
+    if (data && len > 0)
+    {
+        memcpy(p, data, len);
+        p += len;
+    }
+
+    // Calculate IP checksum
+    ipHeader[10] = 0; ipHeader[11] = 0;
+    u16 ipChecksum = IPChecksum(ipHeader, 20);
+    ipHeader[10] = (ipChecksum >> 8);
+    ipHeader[11] = (ipChecksum & 0xFF);
+
+    // Calculate TCP checksum
+    u16 tcpChecksum = TCPChecksum(srcIP, dstIP, tcpHeader, tcpLen + len);
+    tcpHeader[16] = (tcpChecksum >> 8);
+    tcpHeader[17] = (tcpChecksum & 0xFF);
+
+    if (Callback)
+        Callback(packet, p - packet);
+}
+
 void Net_Switch::SendICMPPacket(u32 srcIP, u32 dstIP, u8 type, u8 code, u8* data, int len)
 {
     u8 packet[2048];
@@ -712,8 +772,59 @@ void Net_Switch::HandleTCPFrame(u8* ipHeader, int ipLen)
     u8 ihl = (ipHeader[0] & 0x0F) * 4;
     if (ipLen < ihl + 20) return;
 
-    // TCP forwarding - to be implemented
-    printf("Net_Switch: TCP packet received (not yet implemented)\n");
+    u8* tcp = ipHeader + ihl;
+    
+    // Extract IP addresses
+    u32 srcIP = ntohl(*(u32*)&ipHeader[12]);
+    u32 dstIP = ntohl(*(u32*)&ipHeader[16]);
+    
+    // Extract TCP fields
+    u16 srcPort = ntohs(*(u16*)&tcp[0]);
+    u16 dstPort = ntohs(*(u16*)&tcp[2]);
+    u32 seqNum = ntohl(*(u32*)&tcp[4]);
+    u32 ackNum = ntohl(*(u32*)&tcp[8]);
+    u8 flags = tcp[13];
+    bool isSYN = (flags & 0x02) != 0;
+    bool isACK = (flags & 0x10) != 0;
+    bool isFIN = (flags & 0x01) != 0;
+    
+    printf("Net_Switch: TCP %u.%u.%u.%u:%u -> %u.%u.%u.%u:%u (flags=0x%02x, seq=%u, ack=%u)\n",
+           srcIP & 0xFF, (srcIP >> 8) & 0xFF, (srcIP >> 16) & 0xFF, (srcIP >> 24) & 0xFF, srcPort,
+           dstIP & 0xFF, (dstIP >> 8) & 0xFF, (dstIP >> 16) & 0xFF, (dstIP >> 24) & 0xFF, dstPort,
+           flags, seqNum, ackNum);
+    
+    // Only handle SYN packets (connection initiation)
+    if (isSYN && !isACK)
+    {
+        // Send SYN-ACK response
+        printf("Net_Switch: Responding to TCP SYN with SYN-ACK\n");
+        u32 responseSeq = 0x12345678; // Fixed sequence number for responses
+        u32 responseAck = seqNum + 1;
+        SendTCPPacket(dstIP, dstPort, srcIP, srcPort, responseSeq, responseAck, 0x12, nullptr, 0); // SYN-ACK
+        
+        // Create TCP connection entry to track this connection
+        u32 key = MakeConnectionKey(srcIP, srcPort);
+        TCPConnections[key] = {
+            .socket = -1,
+            .clientIP = srcIP,
+            .clientPort = srcPort,
+            .destIP = dstIP,
+            .destPort = dstPort,
+            .connected = true
+        };
+    }
+    else if (isACK && !isSYN && !isFIN)
+    {
+        // ACK to our SYN-ACK - connection is established
+        u32 key = MakeConnectionKey(srcIP, srcPort);
+        auto it = TCPConnections.find(key);
+        if (it != TCPConnections.end())
+        {
+            printf("Net_Switch: TCP connection established\n");
+            // Connection is now active, we'll accept data from the client
+            // For now, we just keep the connection open without forwarding to a real server
+        }
+    }
 }
 
 void Net_Switch::HandleUDPFrame(u8* ipHeader, int ipLen)
