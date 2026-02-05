@@ -541,10 +541,11 @@ void Net_Switch::ProcessTCPConnections()
     
     // Poll all sockets at once (timeout 0 = non-blocking check)
     int ready = poll(pollfds.data(), pollfds.size(), 0);
-    if (ready <= 0)
-        return; // No sockets ready or error
     
-    // Process sockets that have activity
+    // Note: We don't return early even if ready <= 0, because we need to check
+    // connecting sockets that might not show activity yet but need status checks
+    
+    // Process all sockets (check connecting ones even without poll activity)
     for (auto it = TCPConnections.begin(); it != TCPConnections.end(); )
     {
         TCPConnection& conn = it->second;
