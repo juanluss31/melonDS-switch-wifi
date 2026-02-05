@@ -574,11 +574,19 @@ void Net_Switch::ProcessTCPConnections()
         {
             if (conn.connecting)
             {
+                // Log poll status for connecting socket
+                if (pollIndex >= 0)
+                {
+                    printf("Net_Switch: Checking connecting socket port %d, revents=0x%x (POLLOUT=0x%x)\n",
+                           conn.clientPort, pollfds[pollIndex].revents, POLLOUT);
+                }
+                
                 // Check if socket is ready for writing (connection established)
                 if (pollIndex >= 0 && (pollfds[pollIndex].revents & POLLOUT))
                 {
                     int err = 0;
                     socklen_t errLen = sizeof(err);
+                    printf("Net_Switch: POLLOUT detected, checking SO_ERROR\n");
                     if (getsockopt(conn.socket, SOL_SOCKET, SO_ERROR, &err, &errLen) == 0 && err == 0)
                     {
                         conn.connecting = false;
