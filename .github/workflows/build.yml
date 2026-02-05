@@ -37,7 +37,7 @@ jobs:
           make -j$(nproc --all)
 
       - name: Upload artifact
-        uses: actions/upload-artifact@v3
+        uses: actions/upload-artifact@v4
         with:
           name: melonDS-nro
           path: build/melonDS.nro
