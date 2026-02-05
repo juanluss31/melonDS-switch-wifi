@@ -529,7 +529,7 @@ void Net_Switch::ProcessTCPConnections()
 
     // Build pollfd array for all TCP sockets
     std::vector<struct pollfd> pollfds;
-    std::vector<u16> portMap; // Map poll index to client port
+    std::vector<u32> keyMap; // Map poll index to TCPConnections key
     
     for (auto& pair : TCPConnections)
     {
@@ -542,7 +542,7 @@ void Net_Switch::ProcessTCPConnections()
             pfd.events = pair.second.connecting ? (POLLOUT | POLLERR | POLLHUP) : POLLIN;
             pfd.revents = 0;
             pollfds.push_back(pfd);
-            portMap.push_back(pair.first);
+            keyMap.push_back(pair.first);
         }
     }
     
@@ -563,9 +563,9 @@ void Net_Switch::ProcessTCPConnections()
 
         // Find this socket in the pollfd array
         int pollIndex = -1;
-        for (size_t i = 0; i < portMap.size(); i++)
+        for (size_t i = 0; i < keyMap.size(); i++)
         {
-            if (portMap[i] == it->first)
+            if (keyMap[i] == it->first)
             {
                 pollIndex = i;
                 break;
@@ -651,7 +651,7 @@ void Net_Switch::ProcessTCPConnections()
             }
 
             // Only recv if socket has data available (POLLIN)
-            if (!conn.connecting && (pollfds[pollIndex].revents & POLLIN))
+            if (pollIndex >= 0 && !conn.connecting && (pollfds[pollIndex].revents & POLLIN))
             {
                 u8 buffer[2048];
                 ssize_t received = recv(conn.socket, buffer, sizeof(buffer), MSG_DONTWAIT);
