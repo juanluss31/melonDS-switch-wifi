@@ -788,26 +788,25 @@ void Net_Switch::HandleTCPFrame(u8* ipHeader, int ipLen)
     bool isSYN = (flags & 0x02) != 0;
     bool isACK = (flags & 0x10) != 0;
     bool isFIN = (flags & 0x01) != 0;
-    bool isPSH = (flags & 0x08) != 0;
     
     int dataLen = ipLen - ihl - tcpHeaderLen;
     
-    printf("Net_Switch: TCP %u.%u.%u.%u:%u -> %u.%u.%u.%u:%u (flags=0x%02x, seq=%u, ack=%u, len=%d)\n",
+    printf("Net_Switch: TCP %u.%u.%u.%u:%u -> %u.%u.%u.%u:%u (flags=0x%02x)\n",
            srcIP & 0xFF, (srcIP >> 8) & 0xFF, (srcIP >> 16) & 0xFF, (srcIP >> 24) & 0xFF, srcPort,
            dstIP & 0xFF, (dstIP >> 8) & 0xFF, (dstIP >> 16) & 0xFF, (dstIP >> 24) & 0xFF, dstPort,
-           flags, seqNum, ackNum, dataLen);
+           flags);
     
     u32 key = MakeConnectionKey(srcIP, srcPort);
-    auto it = TCPConnections.find(key);
     
-    // Handle SYN (new connection)
+    // Only handle SYN packets (new connection initiation)
     if (isSYN && !isACK)
     {
         printf("Net_Switch: Responding to TCP SYN with SYN-ACK\n");
-        u32 responseSeq = 0x12345678; // Fixed sequence number for responses
+        u32 responseSeq = 0x10000000;
         u32 responseAck = seqNum + 1;
-        SendTCPPacket(dstIP, dstPort, srcIP, srcPort, responseSeq, responseAck, 0x12, nullptr, 0); // SYN-ACK
+        SendTCPPacket(dstIP, dstPort, srcIP, srcPort, responseSeq, responseAck, 0x12, nullptr, 0);
         
+        // Track connection
         TCPConnections[key] = {
             .socket = -1,
             .clientIP = srcIP,
@@ -817,56 +816,27 @@ void Net_Switch::HandleTCPFrame(u8* ipHeader, int ipLen)
             .connected = false
         };
     }
-    // Handle ACK to our SYN-ACK (connection established)
-    else if (isACK && !isSYN && !isFIN && dataLen == 0)
+    // For all other packets on established connections, just send ACK
+    else
     {
-        if (it != TCPConnections.end() && !it->second.connected)
+        auto it = TCPConnections.find(key);
+        if (it != TCPConnections.end())
         {
-            printf("Net_Switch: TCP connection established\n");
-            it->second.connected = true;
-        }
-    }
-    // Handle data with PSH flag (client sending data)
-    else if (isPSH && isACK && dataLen > 0)
-    {
-        if (it != TCPConnections.end() && it->second.connected)
-        {
-            printf("Net_Switch: TCP data received (%d bytes), sending ACK\n", dataLen);
+            // Send ACK for this packet - acknowledge the sequence number + data length
+            u32 responseSeq = 0x10000001;
+            u32 responseAck = seqNum + (dataLen > 0 ? dataLen : (isFIN ? 1 : 0));
+            printf("Net_Switch: Sending TCP ACK\n");
+            SendTCPPacket(dstIP, dstPort, srcIP, srcPort, responseSeq, responseAck, 0x10, nullptr, 0);
             
-            // Send ACK for the received data
-            u32 responseSeq = 0x12345679;
-            u32 responseAck = seqNum + dataLen;
-            SendTCPPacket(dstIP, dstPort, srcIP, srcPort, responseSeq, responseAck, 0x10, nullptr, 0); // ACK
-            
-            // Send a minimal HTTP response if it looks like an HTTP request
-            if (dataLen >= 4)
+            // If FIN, also close the connection
+            if (isFIN)
             {
-                u8* data = tcp + tcpHeaderLen;
-                if (data[0] == 'G' && data[1] == 'E' && data[2] == 'T')
-                {
-                    printf("Net_Switch: HTTP GET request detected, sending minimal response\n");
-                    const char* response = 
-                        "HTTP/1.1 503 Service Unavailable\r\n"
-                        "Connection: close\r\n"
-                        "Content-Length: 0\r\n"
-                        "\r\n";
-                    u32 respSeq = 0x1234567A;
-                    SendTCPPacket(dstIP, dstPort, srcIP, srcPort, respSeq, responseAck, 0x18, 
-                                  (u8*)response, strlen(response)); // PSH+ACK
-                }
+                printf("Net_Switch: Sending FIN-ACK in response\n");
+                responseSeq = 0x10000002;
+                SendTCPPacket(dstIP, dstPort, srcIP, srcPort, responseSeq, responseAck + 1, 0x11, nullptr, 0);
+                TCPConnections.erase(it);
             }
         }
-    }
-    // Handle FIN (client closing connection)
-    else if (isFIN && isACK)
-    {
-        printf("Net_Switch: TCP FIN received, sending FIN-ACK\n");
-        u32 responseSeq = 0x1234567B;
-        u32 responseAck = seqNum + 1;
-        SendTCPPacket(dstIP, dstPort, srcIP, srcPort, responseSeq, responseAck, 0x11, nullptr, 0); // FIN-ACK
-        
-        if (it != TCPConnections.end())
-            TCPConnections.erase(it);
     }
 }
 
