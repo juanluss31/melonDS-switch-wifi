@@ -21,6 +21,7 @@
 #include <time.h>
 #include <errno.h>
 #include <netdb.h>
+#include <vector>
 #include "Net_Switch.h"
 
 #ifdef __SWITCH__
@@ -515,31 +516,64 @@ void Net_Switch::ProcessUDPConnections()
 void Net_Switch::ProcessTCPConnections()
 {
 #ifdef __SWITCH__
-    if (!TCPConnections.empty())
-        printf("Net_Switch: ProcessTCPConnections - checking %zu connections\n", TCPConnections.size());
+    if (TCPConnections.empty())
+        return;
+
+    // Build pollfd array for all TCP sockets
+    std::vector<struct pollfd> pollfds;
+    std::vector<u16> portMap; // Map poll index to client port
     
+    for (auto& pair : TCPConnections)
+    {
+        if (pair.second.socket >= 0)
+        {
+            struct pollfd pfd;
+            pfd.fd = pair.second.socket;
+            pfd.events = pair.second.connecting ? POLLOUT : POLLIN;
+            pfd.revents = 0;
+            pollfds.push_back(pfd);
+            portMap.push_back(pair.first);
+        }
+    }
+    
+    if (pollfds.empty())
+        return;
+    
+    // Poll all sockets at once (timeout 0 = non-blocking check)
+    int ready = poll(pollfds.data(), pollfds.size(), 0);
+    if (ready <= 0)
+        return; // No sockets ready or error
+    
+    // Process sockets that have activity
     for (auto it = TCPConnections.begin(); it != TCPConnections.end(); )
     {
         TCPConnection& conn = it->second;
         bool eraseConn = false;
+
+        // Find this socket in the pollfd array
+        int pollIndex = -1;
+        for (size_t i = 0; i < portMap.size(); i++)
+        {
+            if (portMap[i] == it->first)
+            {
+                pollIndex = i;
+                break;
+            }
+        }
+        
+        // Skip if socket wasn't polled or has no activity
+        if (pollIndex < 0 || pollfds[pollIndex].revents == 0)
+        {
+            ++it;
+            continue;
+        }
 
         if (conn.socket >= 0)
         {
             if (conn.connecting)
             {
                 // Check if socket is ready for writing (connection established)
-                struct pollfd pfd;
-                pfd.fd = conn.socket;
-                pfd.events = POLLOUT;
-                pfd.revents = 0;
-                
-                int pollResult = poll(&pfd, 1, 0);
-                if (pollResult < 0)
-                {
-                    printf("Net_Switch: poll() failed for port %d (errno=%d)\n", conn.clientPort, errno);
-                    eraseConn = true;
-                }
-                else if (pollResult > 0 && (pfd.revents & POLLOUT))
+                if (pollfds[pollIndex].revents & POLLOUT)
                 {
                     int err = 0;
                     socklen_t errLen = sizeof(err);
@@ -569,38 +603,39 @@ void Net_Switch::ProcessTCPConnections()
                 }
             }
 
-            u8 buffer[2048];
-            printf("Net_Switch: About to recv on port %d socket %d\n", conn.clientPort, conn.socket);
-            ssize_t received = recv(conn.socket, buffer, sizeof(buffer), MSG_DONTWAIT);
-            printf("Net_Switch: recv returned %zd (errno=%d)\n", received, errno);
-            if (received > 0)
+            // Only recv if socket has data available (POLLIN)
+            if (!conn.connecting && (pollfds[pollIndex].revents & POLLIN))
             {
-                printf("Net_Switch: TCP backend received %zd bytes, forwarding to client (seq=%u, ack=%u)\n", 
-                       received, conn.serverSeqNext, conn.clientSeq);
-                SendTCPPacket(conn.destIP, conn.destPort, conn.clientIP, conn.clientPort,
-                              conn.serverSeqNext, conn.clientSeq, 0x18, buffer, (int)received);
-                conn.serverSeqNext += (u32)received;
-                conn.lastActivity = CurrentTime;
-            }
-            else if (received == 0)
-            {
-                printf("Net_Switch: TCP backend closed connection (seq=%u, ack=%u)\n",
-                       conn.serverSeqNext, conn.clientSeq);
-                SendTCPPacket(conn.destIP, conn.destPort, conn.clientIP, conn.clientPort,
-                              conn.serverSeqNext, conn.clientSeq, 0x11, nullptr, 0);
-                conn.serverSeqNext += 1;
-                eraseConn = true;
-            }
-            else if (errno != EWOULDBLOCK && errno != EAGAIN)
-            {
-                printf("Net_Switch: TCP backend recv failed (errno=%d)\n", errno);
-                eraseConn = true;
+                u8 buffer[2048];
+                ssize_t received = recv(conn.socket, buffer, sizeof(buffer), MSG_DONTWAIT);
+                if (received > 0)
+                {
+                    printf("Net_Switch: TCP backend received %zd bytes, forwarding to client (seq=%u, ack=%u)\n", 
+                           received, conn.serverSeqNext, conn.clientSeq);
+                    SendTCPPacket(conn.destIP, conn.destPort, conn.clientIP, conn.clientPort,
+                                  conn.serverSeqNext, conn.clientSeq, 0x18, buffer, (int)received);
+                    conn.serverSeqNext += (u32)received;
+                    conn.lastActivity = CurrentTime;
+                }
+                else if (received == 0)
+                {
+                    printf("Net_Switch: TCP backend closed connection (seq=%u, ack=%u)\n",
+                           conn.serverSeqNext, conn.clientSeq);
+                    SendTCPPacket(conn.destIP, conn.destPort, conn.clientIP, conn.clientPort,
+                                  conn.serverSeqNext, conn.clientSeq, 0x11, nullptr, 0);
+                    conn.serverSeqNext += 1;
+                    eraseConn = true;
+                }
+                else if (errno != EWOULDBLOCK && errno != EAGAIN)
+                {
+                    printf("Net_Switch: TCP backend recv failed (errno=%d)\n", errno);
+                    eraseConn = true;
+                }
             }
         }
 
         if (eraseConn)
         {
-            printf("Net_Switch: Closing TCP connection on port %d\n", conn.clientPort);
             if (conn.socket >= 0)
                 close(conn.socket);
             it = TCPConnections.erase(it);
